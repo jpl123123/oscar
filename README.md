@@ -9,21 +9,46 @@ Triton（triton-ascend，回退纯 torch NPU 路径），量化/反量化/旋转
 
 ## 真机一键（用户唯一动作）
 
+Docker 环境（vllm / vllm-ascend / torch-npu / triton-ascend 已预装）内，仓库挂载后：
+
 ```bash
-git pull && bash delivery/install_and_launch.sh
+cd /workspace/new_oscar_triton && git pull && bash delivery/install_and_launch.sh
 ```
 
-流程：自检（vllm-ascend 0.23.0 + HAS_TRITON）→ 安装插件 wheel → 指纹（HEAD/sha/入口点）
-→ 生成旋转检查点 `oscar_rotations.pt`（`tools/gen_rotations.py`，离线校准）→ 数值 probe
-（ref + triton 双模式，**任意 FAIL 拒绝 serve**）→ 以用户目标命令拉起 `vllm serve`
-（`delivery/serve_oscar.sh`，端口 8989，TP4，MTP3，262144 上下文，原命令逐项保留）。
+### 容器启动示例（NPU 设备 + 驱动 + 仓库 + 模型目录挂载）
 
-生成 PT / 仅起服务等变体：
+```bash
+docker run -it --rm \
+  --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 \
+  --device /dev/davinci_manager --device /dev/hisi_hdc --device /dev/devmm_svm \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v "$(pwd)":/workspace/new_oscar_triton \
+  -v /softwarePlatform:/softwarePlatform \
+  -e ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+  <vllm-ascend 镜像> bash
+```
+
+> 挂载路径/设备数按你现网 docker 启动方式为准；脚本只依赖：容器内 `python3` 可导入
+> `vllm/vllm_ascend/torch_npu`、`torch.npu.is_available()` 为 True、仓库与模型路径已挂载。
+
+### 脚本流程（已按 Docker 预装环境裁剪）
+
+自检（版本 / NPU 可见性 / `HAS_TRITON` / 插件入口点）→ 安装插件（**`pip install
+--no-deps --no-build-isolation -e .`，只装自身、不解析/升级预装依赖**；入口点已存在则自动跳过，
+`OSCAR_SKIP_INSTALL=1` 强制跳过）→ 指纹（HEAD/sha256/入口点）→ 生成旋转检查点
+`oscar_rotations.pt`（`tools/gen_rotations.py`，离线校准）→ 数值 probe（ref + triton 双模式，
+**任意 FAIL 拒绝 serve**）→ 以用户目标命令拉起 `vllm serve`（`delivery/serve_oscar.sh`，
+端口 8989，TP4，MTP3，262144 上下文，原命令逐项保留）。
+
+变体：
 
 ```bash
 OSCAR_ASCEND_GEN_ROTATIONS=1 bash delivery/install_and_launch.sh   # 强制重新生成旋转 pt
 OSCAR_ASCEND_GEN_PROMPTS=8 OSCAR_ASCEND_GEN_MAXLEN=256 bash delivery/install_and_launch.sh
 OSCAR_EXTRA_ARGS="--enforce-eager" bash delivery/serve_oscar.sh    # 建议：OSCAR 窗口仅 eager 验证
+OSCAR_SKIP_INSTALL=1 bash delivery/install_and_launch.sh           # 复用容器内已装插件
 ```
 
 ## 本地门禁（开发机，无 NPU）
@@ -44,7 +69,7 @@ python3 tests/test_numeric.py    # CPU 镜像：store 字节差=0 / dequant≤1e
 
 ## 诚实边界（务必阅读）
 
-- **数值**：本地 CPU 镜像 6/6 PASS（store=0、dequant≤1e-5、decode≤1e-4、旋转不变性）。
+- **数值**：本地 CPU 镜像 7/7 PASS（store 字节差=0、dequant≤1e-5、decode≤1e-4、旋转不变性、旋转加载/缺层回退）。
   Triton 内核尚未在任何 NPU 编译运行——真机 probe 的 `--mode triton` 会**逐字节对比**
   Triton 与参考实现（`ref`），FAIL 即拒绝 serve（R3）。
 - **页常数**：你提供的 P=801,792 等为 HYPOTHESIS（参考树未含）；服务启动日志与 probe
