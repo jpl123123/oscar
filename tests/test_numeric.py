@@ -182,6 +182,16 @@ def t_rotation_loader():
         assert torch.equal(get_layer_rotation("", "x", D, torch.device("cpu")), torch.eye(D))
 
 
+def t_plugin_purity():
+    """回归守卫：插件入口文件顶层禁止 vllm_ascend 导入（真机 Docker 循环导入教训）。"""
+    import pathlib
+    import re
+
+    src = pathlib.Path("oscar_ascend/plugin.py").read_text(encoding="utf-8")
+    top = re.findall(r"^(?:import|from)\s+vllm_ascend[^\n]*", src, re.M)
+    assert not top, f"插件顶层仍含 vllm_ascend 导入: {top}"
+
+
 def main():
     print("== oscar_ascend CPU 数值镜像 ==")
     check("quantize/dequant ≤1e-5", t_quant_dequant)
@@ -191,6 +201,7 @@ def main():
     check("rotation invariance ≤1e-3", t_rotation_invariance)
     check("prefill continuation 形状/运行", t_prefill_ref)
     check("rotation 检查点加载/缺层回退", t_rotation_loader)
+    check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0
 

@@ -102,7 +102,8 @@ ROT_DEFAULT="$REPO_ROOT/oscar_rotations.pt"
 if [ -z "${OSCAR_ASCEND_K_ROTATION_PATH:-}" ] && [ -z "${OSCAR_ASCEND_V_ROTATION_PATH:-}" ]; then
     if [ "${OSCAR_ASCEND_GEN_ROTATIONS:-0}" == "1" ] || [ ! -e "$ROT_DEFAULT" ]; then
         step "生成 OSCAR 旋转检查点（离线校准，一次性；Docker 内执行）"
-        $PYTHON tools/gen_rotations.py --model "$MODEL_PATH" --save "$ROT_DEFAULT" \
+        # 校准进程关闭插件（OSCAR_ASCEND_ENABLE=0）：BF16 原路径采集 K/V，避免与注入路径互扰
+        OSCAR_ASCEND_ENABLE=0 $PYTHON tools/gen_rotations.py --model "$MODEL_PATH" --save "$ROT_DEFAULT" \
             --prompts "${OSCAR_ASCEND_GEN_PROMPTS:-4}" --max-len "${OSCAR_ASCEND_GEN_MAXLEN:-128}" \
             2>&1 | tee "$LOG_DIR/genrot_$STAMP.log" || fail "旋转检查点生成失败"
     else
