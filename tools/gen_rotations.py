@@ -35,6 +35,28 @@ def _npu() -> bool:
         return False
 
 
+def _force_ascend_platform() -> bool:
+    """自愈：Docker 中 platform 自动激活可能失败（device_type=""），在此强制 NPU。
+
+    成功判定：current_platform.device_type == "npu"。失败不吞异常，交由 diag 定位。
+    """
+    try:
+        import vllm.platforms as vp
+
+        if getattr(vp.current_platform, "device_type", "") == "npu":
+            return True
+        from vllm_ascend.platform import NPUPlatform
+
+        vp.current_platform = NPUPlatform()
+        ok = getattr(vp.current_platform, "device_type", "") == "npu"
+        print(f"[gen-rotations] 强制激活 NPUPlatform: {'OK' if ok else 'FAIL'} "
+              f"(device_type={getattr(vp.current_platform, 'device_type', '?')!r})")
+        return ok
+    except Exception as e:
+        print(f"[gen-rotations] 强制激活 NPUPlatform 异常: {type(e).__name__}: {e}")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -47,6 +69,14 @@ def main() -> int:
     on_npu = _npu()
     dev = "npu" if on_npu else "cpu"
     print(f"[gen-rotations] device={dev} prompts={args.prompts} max_len={args.max_len}")
+
+    if not _force_ascend_platform():
+        print(
+            "[gen-rotations] ❌ 平台未激活（device_type 为空）。请先运行:\n"
+            "    python3 tools/diag_platform.py\n"
+            " 并把输出（或 /tmp/oscar_ascend_logs/selfcheck_*.log）回传。"
+        )
+        return 3
 
     from vllm import LLM, SamplingParams
     from vllm.model_executor.layers.attention import Attention

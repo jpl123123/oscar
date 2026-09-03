@@ -68,6 +68,10 @@ cat "$LOG_DIR/selfcheck_$STAMP.log"
 [ -d "$MODEL_PATH" ] || fail "模型目录不存在（容器内挂载检查）: $MODEL_PATH"
 [ -f "oscar_ascend/plugin.py" ] || fail "插件源码缺失（仓库挂载检查）: oscar_ascend/plugin.py"
 
+# Diag：platform 注册/device_type 现场取证（vendor fork 差异定位；只报告不阻断）
+step "平台注册诊断（tools/diag_platform.py，异常时请回传输出）"
+$PYTHON tools/diag_platform.py 2>&1 | tee "$LOG_DIR/diag_platform_$STAMP.log" || true
+
 # ---------- 阶段2 安装（只装插件，--no-deps 不触碰预装环境） ----------
 _ep_check() {
     $PYTHON -c "import importlib.metadata as md; eps=[e for e in md.entry_points(group='vllm.general_plugins') if e.name=='oscar_ascend']; import sys; sys.exit(0 if eps else 1)"
