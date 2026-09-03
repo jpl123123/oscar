@@ -83,3 +83,19 @@ reflect gate（本记录）→ 待跑
 | 6 | 记录提交 | 随工作区提交 |
 
 **最终 verdict：OPEN（卡在：真机 diag_platform.py 输出未回传；回传后按 Q1 五证据收敛）**
+
+
+## §7 后续进展（2026-09-03 12:53 真机日志二）
+
+- 平台问题**已自愈收敛**：`[gen-rotations] 强制激活 NPUPlatform: OK (device_type='npu')`，
+  EngineCore 以 `device_config=npu` 启动到模型装载。Q1 假设成立（vendor 栈平台为惰性注册，
+  强制激活即生效）——该环节由 8411ad8 的 `_force_ascend_platform()` 闭环。
+- **新失败（OOM）与根因**：模型装载在 `w8a8_dynamic.get_weight → torch.empty(int8)` 处
+  `NPU out of memory`（29.49 GiB 总容量 / 28.97 GiB 已用）。日志自证校准
+  `tensor_parallel_size=1`——27B W8A8 权重 ≈27GB > 单卡容量，TP=1 必然 OOM（目标
+  serve 用 TP4 正是为此）。**修复：gen_rotations 默认 `{"tensor_parallel_size":4,
+  "gpu_memory_utilization":0.9}`（env `OSCAR_ASCEND_GEN_LLM_ARGS` 可覆盖）+ 一键脚本
+  预检 `npu-smi` 快照 + 仅清理本模型残留进程（`pkill -f $MODEL_PATH`）。**
+- 环境确认：vendor `patch_mamba_config.py:104` 把 attention block size 设为 **1536**
+  （hybrid 双网格物理页=1536 / kernel=128），与本方案 N-06/双网格契约一致，无需改代码。
+- 本记录保持 OPEN；退出条件改为：TP4 校准成功生成 oscar_rotations.pt → probe → serve。

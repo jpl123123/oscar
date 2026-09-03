@@ -101,7 +101,18 @@ import oscar_ascend
 print("  oscar_ascend import OK, version", oscar_ascend.__version__)
 PY
 
-# ---------- 阶段4 生成 pt（OSCAR 旋转检查点） ----------
+# ---------- 阶段3.5 NPU 显存/残留进程预检 ----------
+step "NPU 显存预检 + 残留 vllm 进程清理（仅限本模型进程）"
+if command -v npu-smi >/dev/null 2>&1; then
+    npu-smi info 2>&1 | tee "$LOG_DIR/npu_smi_$STAMP.log" || true
+else
+    echo "  npu-smi 不在 PATH（Docker 未挂载）——跳过，仅凭日志判断显存"
+fi
+# 上一轮崩溃的服务/校准进程可能仍占 NPU 显存（W8A8 27B 单卡 29.49GiB 极紧）
+pkill -f "$MODEL_PATH" 2>/dev/null || true
+sleep 3 || true
+
+# ---------- 阶段4 生成 pt（OSCAR 旋转检查点；校准默认 TP4 与 serve 一致） ----------
 ROT_DEFAULT="$REPO_ROOT/oscar_rotations.pt"
 if [ -z "${OSCAR_ASCEND_K_ROTATION_PATH:-}" ] && [ -z "${OSCAR_ASCEND_V_ROTATION_PATH:-}" ]; then
     if [ "${OSCAR_ASCEND_GEN_ROTATIONS:-0}" == "1" ] || [ ! -e "$ROT_DEFAULT" ]; then

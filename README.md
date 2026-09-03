@@ -47,6 +47,8 @@ docker run -it --rm \
 ```bash
 OSCAR_ASCEND_GEN_ROTATIONS=1 bash delivery/install_and_launch.sh   # 强制重新生成旋转 pt
 OSCAR_ASCEND_GEN_PROMPTS=8 OSCAR_ASCEND_GEN_MAXLEN=256 bash delivery/install_and_launch.sh
+OSCAR_ASCEND_GEN_LLM_ARGS='{"tensor_parallel_size":4,"gpu_memory_utilization":0.9}' \
+  bash delivery/install_and_launch.sh   # 校准默认即 TP4（与 serve 一致，27B 单卡必 OOM）
 OSCAR_EXTRA_ARGS="--enforce-eager" bash delivery/serve_oscar.sh    # 建议：OSCAR 窗口仅 eager 验证
 OSCAR_SKIP_INSTALL=1 bash delivery/install_and_launch.sh           # 复用容器内已装插件
 ```

@@ -82,6 +82,10 @@ def main() -> int:
     from vllm.model_executor.layers.attention import Attention
 
     llm_args = json.loads(os.environ.get("OSCAR_ASCEND_GEN_LLM_ARGS", "{}"))
+    # 默认 TP4 + 0.9 显存（目标 serve 同款）：27B W8A8 权重 ~27GB > 单卡 29.49GiB，
+    # TP=1 必然 OOM（真机 2026-09-03 12:54 实测）；用 4 卡切分后每卡 ~6.8GB。
+    llm_args.setdefault("tensor_parallel_size", 4)
+    llm_args.setdefault("gpu_memory_utilization", 0.9)
     llm = LLM(
         model=args.model,
         enforce_eager=True,
