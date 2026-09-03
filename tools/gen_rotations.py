@@ -26,6 +26,14 @@ from pathlib import Path
 import torch
 
 
+# 真机实测（2026-09-03 12:58）：多线程父进程 fork 出 EngineCore 后，autograd 线程
+# set_num_threads 触发 "ParallelOpenMP.cpp:64 Invalid thread pool" 硬崩溃。
+# 必须在任何 vllm 导入前设置（vllm.envs 于 import 时读取该值）。
+import os as _os
+
+_os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
 def _npu() -> bool:
     try:
         import torch_npu  # noqa: F401

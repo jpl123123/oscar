@@ -28,6 +28,7 @@ SERVE_LOG="$LOG_DIR/serve_$STAMP.log"
 
 MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
 export VLLM_PLUGINS="${VLLM_PLUGINS:-oscar_ascend}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 fail() { echo "❌ [oscar-ascend] $1" >&2; echo "   日志: $LOG_DIR/*$STAMP*" >&2; exit 1; }
 step() { echo "==> [oscar-ascend] $1"; }

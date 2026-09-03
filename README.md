@@ -68,6 +68,7 @@ python3 tests/test_numeric.py    # CPU 镜像：store 字节差=0 / dequant≤1e
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | `0.0` | 裁剪分位数（>0 走 `torch.quantile`，NPU 未正式验证 → 默认关） |
 | `OSCAR_ASCEND_SINK_TOKENS` / `RECENT_TOKENS` / `STAGING_TOKENS` | `64` / `256` / `8192` | BF16 Sink/Recent 窗口与 staging 容量 |
 | `OSCAR_ASCEND_FORCE_TORCH` | `0` | `1`=强制 torch 参考路径（跳过 Triton，调试用） |
+| `VLLM_WORKER_MULTIPROC_METHOD` | `spawn`（脚本默认） | 多进程 worker 启动方式；该 Docker 多线程父进程下 `fork` 会触发 PyTorch `ParallelOpenMP Invalid thread pool` 崩溃（12:58 实测） |
 
 ## 诚实边界（务必阅读）
 

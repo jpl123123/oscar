@@ -99,3 +99,18 @@ reflect gate（本记录）→ 待跑
 - 环境确认：vendor `patch_mamba_config.py:104` 把 attention block size 设为 **1536**
   （hybrid 双网格物理页=1536 / kernel=128），与本方案 N-06/双网格契约一致，无需改代码。
 - 本记录保持 OPEN；退出条件改为：TP4 校准成功生成 oscar_rotations.pt → probe → serve。
+
+
+## §8 后续进展（2026-09-03 12:58 真机日志三）—— fork 线程池崩溃
+
+- TP4 已生效（EngineCore world_size=4；rank1/2/3 workers 开始初始化），但 EngineCore
+  在 autograd 线程初始化时 C++ 硬崩溃：`pool INTERNAL ASSERT FAILED at
+  "/pytorch/aten/src/ATen/ParallelOpenMP.cpp":64 Invalid thread pool!`
+  （`set_num_threads` → torch::autograd::Engine::thread_init）。
+- 根因：vllm 多进程 worker 默认 **fork** 启动；父进程（gen 校准，pid=765）已多线程
+  （torch_npu/FunctionLoader），fork 后子进程 OpenMP 线程池失效（父日志自己警告
+  `use of fork() may lead to deadlocks in the child`）。
+- 修复：任何 vllm 导入前 `VLLM_WORKER_MULTIPROC_METHOD=spawn`（vllm.envs.py:68/892 支持
+  literal ["fork","spawn"]）——gen_rotations 顶部 setdefault + install/serve 脚本默认导出。
+- 该崩溃与插件/算子无关；同因很可能会在 TP4 的 vllm serve 上复现，故一并写入 serve 默认。
+- 本记录保持 OPEN；退出条件：spawn 后校准成功 → probe → serve。
