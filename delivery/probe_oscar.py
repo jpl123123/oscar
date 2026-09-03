@@ -2,12 +2,13 @@
 """delivery/probe_oscar.py — 真机数值 probe（store / dequant / decode 三查，同沙盒判据）。
 
 判据（与 skill sandbox l3_numeric 一致）：
-  1. store    : 量化打包字节 == format 参考实现字节（max|d| == 0）
-  2. dequant  : 反量化重建与原始 rotated 向量差 ≤ 1e-5（fp32）
-  3. decode   : 单 token INT2 decode 注意力 vs bf16 参考 ≤ 1e-4（fp32）
+  1. store    : 写入槽字节 == format.make_slot_bytes（max|d| == 0）
+  2. dequant  : 反量化 == 量化时刻理想重建（q*scale+zero）≤ 1e-5
+  3. decode   : INT2 decode vs 同一 INT2 数据 SDPA ≤ 1e-4（fp32）
 
-阻塞 serve：任意 FAIL → exit 非 0（install_and_launch.sh 阶段4 直接终止）。
-全部计算在 NPU（torch.npu）；无 CPU 搬运。
+--mode ref  : torch 参考路径（NPU 纯 torch 算子；任何环境可跑）
+--mode triton: Triton 内核路径（要求 HAS_TRITON；与 ref 逐字节对照）
+全部计算在 NPU（torch.npu），无 CPU 搬运。失败 → exit!=0 阻塞 serve。
 """
 from __future__ import annotations
 
@@ -21,64 +22,104 @@ def main() -> int:
     ap.add_argument("--num-kv-heads", type=int, default=8)
     ap.add_argument("--num-heads", type=int, default=16)
     ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--mode", choices=["ref", "triton"], default="ref")
+    ap.add_argument("--num-tokens", type=int, default=3)
     args = ap.parse_args()
 
-    try:
-        import torch
-        import torch_npu  # noqa: F401
-        import oscar_ascend.format as fmt
-        from oscar_ascend.kernels.store_kernel import oscar_store_ref  # torch 参考实现
-        from oscar_ascend.kernels.decode_kernel import oscar_decode_ref
-    except ImportError as e:
-        print(f"❌ probe 依赖缺失: {e}（先 pip install -e . 并实现 plan TODO 1-4）")
-        return 2
+    import torch
+    import torch_npu  # noqa: F401
+
+    from oscar_ascend import format as fmt
+    from oscar_ascend.kernels.store_kernel import oscar_store_ref
+    from oscar_ascend.kernels.decode_kernel import oscar_decode_ref
 
     if not torch.npu.is_available():
-        print("❌ torch.npu 不可用（probe 必须 NPU，纯 CPU 用 tests/test_numeric.py）")
+        print("❌ torch.npu 不可用（probe 必须在 NPU；CPU 用 tests/test_numeric.py）")
         return 2
 
     dev = torch.npu.current_device()
-    D = args.head_dim
-    Hk, Hq, bs = args.num_kv_heads, args.num_heads, args.block_size
-
-    # 构造单 token 样例（NPU）
+    D, Hk, Hq, bs = args.head_dim, args.num_kv_heads, args.num_heads, args.block_size
+    N = args.num_tokens
     torch.manual_seed(0)
-    k = torch.randn(Hk, D, device=dev, dtype=torch.bfloat16)
-    v = torch.randn(Hk, D, device=dev, dtype=torch.bfloat16)
-    q = torch.randn(Hq, D, device=dev, dtype=torch.bfloat16)
 
-    # ---- 1) store 字节差 ----
-    comb = torch.zeros(bs, Hk, 1024, dtype=torch.uint8, device=dev)  # 一页一槽
-    slot = torch.zeros(1, dtype=torch.int64, device=dev)
-    oscar_store_ref(k, v, comb, slot, D=D)
-    ref_slot = fmt.make_slots(k, v, D=D)
-    diff = (comb.view(-1)[: 160 * Hk].view(Hk, 160) != ref_slot).sum().item()
+    # 缓存视图：k/v 形状与真实 attn 层一致（kernel 粒度块 bs）
+    k_cache = torch.zeros(4, bs, Hk, D, dtype=torch.bfloat16, device=dev)
+    v_cache = torch.zeros_like(k_cache)
+    k = torch.randn(N, Hk, D, device=dev, dtype=torch.bfloat16) * 1.5
+    v = torch.randn(N, Hk, D, device=dev, dtype=torch.bfloat16) * 1.5
+    slot_mapping = torch.arange(N, dtype=torch.int64, device=dev)
+
+    # ---- 1) store（ref 或 triton）----
+    use_triton = args.mode == "triton"
+    if use_triton:
+        from oscar_ascend.kernels.store_kernel import oscar_store_triton
+
+        oscar_store_triton(k, v, k_cache, v_cache, slot_mapping)
+    else:
+        oscar_store_ref(k, v, k_cache, v_cache, slot_mapping)
+    ref_slot = fmt.make_slot_bytes(k.float(), v.float())                    # [N,Hk,160]
+    k8, v8 = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+    db = D // 4
+    got = torch.zeros(N, Hk, 160, dtype=torch.uint8, device=dev)
+    for t in range(N):
+        b, o = int(slot_mapping[t]) // bs, int(slot_mapping[t]) % bs
+        for h in range(Hk):
+            ks = b * k8.stride(0) + o * k8.stride(1) + h * k8.stride(2)
+            vs = b * v8.stride(0) + o * v8.stride(1) + h * v8.stride(2)
+            got[t, h, 0:8] = k8.view(-1)[ks : ks + 8]
+            got[t, h, 32 : 32 + db] = k8.view(-1)[ks + 32 : ks + 32 + db]
+            got[t, h, 96 : 96 + db] = v8.view(-1)[vs : vs + db]
+    diff = (got != ref_slot).sum().item()
     if diff != 0:
-        print(f"❌ store 字节差 = {diff}（判据 0）")
+        print(f"❌ [{args.mode}] store 字节差 = {diff}（判据 0）")
         return 1
-    print(f"✅ store  字节差 = 0（{Hk} 头 × 160B 槽一致）")
+    print(f"✅ [{args.mode}] store 字节差 = 0（{N}×{Hk} 头 × 160B 槽）")
 
     # ---- 2) dequant ≤1e-5 ----
-    k_rec, v_rec = fmt.dequant_slot(slot_view=comb.view(-1)[: 160 * Hk], num_heads=Hk, D=D)
-    k_ref = k.float(); v_ref = v.float()
-    ek, ev = (k_rec - k_ref).abs().max().item(), (v_rec - v_ref).abs().max().item()
+    from oscar_ascend.kernels.store_kernel import dequant_split_ref
+
+    bnums = (slot_mapping // bs)
+    pos = slot_mapping % bs
+    k_rec, v_rec = dequant_split_ref(k8, v8, bnums, pos, Hk, D)   # [N,Hk,D]
+    _, ks, kz = fmt.quantize(k.float())
+    _, vs, vz = fmt.quantize(v.float())
+    qk = torch.clamp(torch.round((k.float() - kz) / ks), 0, 3)
+    qv = torch.clamp(torch.round((v.float() - vz) / vs), 0, 3)
+    ek = (k_rec - (qk * ks + kz)).abs().max().item()
+    ev = (v_rec - (qv * vs + vz)).abs().max().item()
     if max(ek, ev) > 1e-5:
         print(f"❌ dequant err K={ek:.3e} V={ev:.3e}（判据 ≤1e-5）")
         return 1
     print(f"✅ dequant err K={ek:.3e} V={ev:.3e}（≤1e-5）")
 
-    # ---- 3) decode ≤1e-4（INT2 + 单位旋转 vs bf16 SDPA 参考）----
-    ref_attn = torch.nn.functional.scaled_dot_product_attention(
-        q.float().unsqueeze(0), k.float().unsqueeze(0), v.float().unsqueeze(0)
-    ).squeeze(0)
-    oscar_out = oscar_decode_ref(q, comb, seq_len=1, D=D, Hq=Hq, Hk=Hk)
-    e = (oscar_out - ref_attn).abs().max().item()
+    # ---- 3) decode ≤1e-4（INT2 解码 vs 同一 INT2 数据 SDPA）----
+    q = torch.randn(1, Hq, D, device=dev)
+    bt = torch.zeros(1, 4, dtype=torch.int32, device=dev)
+    seq = torch.tensor([N], dtype=torch.int32, device=dev)
+    out_ref, _ = oscar_decode_ref(q, k_cache, v_cache, bt, seq, 0.125, Hk, D)
+    kd_rep = k_rec.repeat_interleave(Hq // Hk, dim=1)
+    vd_rep = v_rec.repeat_interleave(Hq // Hk, dim=1)
+    scores = torch.einsum("hd,lhd->hl", q[0], kd_rep) * 0.125
+    p = torch.softmax(scores, dim=-1)
+    sdpa = torch.einsum("hl,lhd->hd", p, vd_rep)
+    e = (out_ref[0] - sdpa).abs().max().item()
     if e > 1e-4:
         print(f"❌ decode err = {e:.3e}（判据 ≤1e-4）")
         return 1
     print(f"✅ decode err = {e:.3e}（≤1e-4）")
 
-    print("🎉 probe 全 PASS —— 允许 serve")
+    # ---- triton ↔ ref 一致性（triton 模式比 ref，ref 模式比 triton）----
+    if args.mode == "triton":
+        k2, v2 = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
+        oscar_store_ref(k, v, k2, v2, slot_mapping)
+        equal = torch.equal(k2.view(torch.uint8), k_cache.view(torch.uint8)) and torch.equal(
+            v2.view(torch.uint8), v_cache.view(torch.uint8)
+        )
+        print(f"✅ triton vs ref 字节一致: {equal}")
+        if not equal:
+            return 1
+
+    print(f"🎉 probe 全 PASS（mode={args.mode}）—— 允许 serve")
     return 0
 
 

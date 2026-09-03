@@ -136,10 +136,10 @@ L5 算子栈（python → triton JIT → triton-ascend backend → NPU）
 3. `AscendOscarAttentionBackendImpl.forward`：
    a. `_ensure_rotations`：按 `layer_name` 取 `R_k/R_v`（`rotation.py` port；缺文件→单位阵）。
    b. `k_rot = k @ R_k`、`v_rot = v @ R_v`（bf16→fp32 matmul，NPU aclnn，non-clip 默认）。
-   c. `oscar_store(k_rot, v_rot, combined_cache_view, slot_mapping, …)`：
-      grid=(N×H,)，slot 基址 = `comb_base + (t*Hk + h)*1024` + `page_stride*blk`；
-      写 N-01 布局：meta(0-7)、pad(8-31)、K idx(32-95)、V idx(96-159)。
-   d. decode 注意力：`q_rot = q @ R_k` → `oscar_decode_attention(q_rot, combined, block_table,
+   c. `oscar_store(k_rot, v_rot, k8, v8, slot_mapping, …)`（k8/v8 双指针，§5.2）：
+      grid=(N×H,)，k_slot 基址 = `b*k_block_stride + t*k_pos_stride + h*k_head_stride`；
+      K 槽写 meta(0-7)+pad(8-31)+K idx(32-95)，V 槽写 V idx(0-63)（逻辑拼接= N-01 顺序）。
+   d. decode 注意力：`q_rot = q @ R_k` → `oscar_decode_attention(q_rot, k8, v8, block_table,
       seq_lens, …)`（Triton fused stage1 + stage2，PR `triton_oscar_decode.py:24-150/153-250`）
       → `out_true = out_rot @ R_v^T`。
 4. 数值验证（probe/沙盒）：对同一 (token, head)，把 160B 槽读回反量化，与 `(k/v)@R` 比：
@@ -154,7 +154,7 @@ L5 算子栈（python → triton JIT → triton-ascend backend → NPU）
 
 | 候选 | 机制一句话 | 优点 | 缺点 | 结论 |
 |---|---|---|---|---|
-| **候选 1（A·选中）** | 原生 K/V 双视图不动；实现层"组合 160B 槽视图"（k/v 在组张量内物理连续，`model_runner_v1.py:4569-4577` 切分保证）+ `AscendOscarAttentionBackendImpl` 类外科手术（照 kv_c8.py:130 先例） | 零分配/页表/块大小改动；只换 impl；机制全部有成熟先例（C8 手术 + OSCAR PR 内核 + TurboQuant 槽） | 160B 槽嵌在 1024B 原生字节窗内（只用到约 16%）；INT2 收益靠"读写走 160B 字节"而非"少分页"；decode 必须新 Triton 内核 | ✓ |
+| **候选 1（A·选中）** | 原生 K/V 双视图不动；实现层"逻辑 160B 槽拆分落位"（K 槽前 96B + V 槽前 64B，k/v 在组张量内物理连续，`model_runner_v1.py:4569-4577` 切分保证）+ `AscendOscarAttentionBackendImpl` 类外科手术（照 kv_c8.py:130 先例） | 零分配/页表/块大小改动；只换 impl；机制全部有成熟先例（C8 手术 + OSCAR PR 内核 + TurboQuant 槽） | 160B 槽嵌在 1024B 原生字节窗内（只用到约 16%）；INT2 收益靠"读写走 160B 字节"而非"少分页"；decode 必须新 Triton 内核 | ✓ |
 | B | 页内 Sink/History/Recent 三区重排（用户 §5 初步构思：改 `page_size` / 每页 token 数） | 每页字节利用率高分 | **必须先改 `AttentionSpec.page_size_bytes`/`get_kv_cache_shape` → 触发 vllm-ascend hybrid 切分矩阵（`model_runner_v1.py:4569-4577` 的 `*2` 与 4493 分支顺序）→ 无成熟先例的分配手术；且三区物理布局与 PR 的 staging 窗口机制（`:253-336`）不一致** | ✗ 被否决：无先例 + 破坏纯零侵入；三区语义由 A 的 staging 仓库实现（同 PR） |
 | C | 直接改 vllm/vllm-ascend 源码（加 oscar 后端进 selector/platform） | 最贴近 PR 原始集成 | 违反用户"不允许修改原始代码文件"+ skill 铁律2 零侵入 | ✗ 被否决 |
 | D | decode 每次全上下文 dequant 到 scratch 再走原生 paged attention | 复用 `torch_npu._npu_paged_attention`（`attention_v1.py:1363-1382`） | 每步 O(seq_len×D) 带宽+scratch 分配；262k 上下文不可行；N-09 禁止持久 fp32 缓存 | ✗ 被否决：性能/违反 N-09；仅作 A 的 fallback 分支（前缀 prefill dequant 是 TND 一次性，可接受） |
@@ -165,8 +165,8 @@ L5 算子栈（python → triton JIT → triton-ascend backend → NPU）
      （`model_runner_v1.py:4493-4577, 4680`）；大小、页跨距、`page_size_padded`
      （`model_runner_v1.py:5025-5034` = mamba 页对齐）全不动。
   2. k/v 在组张量内**物理连续**（`raw_kv_tensor = raw_k_tensor[conv_pad:]` 后一刀切两半，
-     `:4575-4577`）→ 可无拷贝构造 `(nb, bs, hk, 1024)` uint8 组合视图，160B 槽正好落位，
-     且满足已固化契约 N-06（算子只认 flat uint8 + 显式 page_stride）。
+     `:4575-4577`）→ 无需拼接：按 k8/v8 双指针拆分落位（K 槽 96B、V 槽 64B，逻辑拼接=160B），
+     且满足已固化契约 N-06（算子只认 flat uint8 + 显式 stride）。
   3. impl 类外科手术 = 现成先例（`kv_c8.py:126-130`）；无需改 backend/metadata/分配器。
   4. 数值契约（量化公式、打包位序、fp16 meta、旋转/逆旋转、判据）全部来自 OSCAR PR 官方内核
      （`triton_oscar_store.py:41-77`、`triton_oscar_decode.py:104-141`）——reference-first 达标。
@@ -176,7 +176,7 @@ L5 算子栈（python → triton JIT → triton-ascend backend → NPU）
     L3 判据 + 本地 triton-ascend 单 kernel 冒烟（vm/ 回路）+ 真机 probe（全 PASS 才 serve）。
     未验证前该机制标 UNKNOWN（§8 R3）。**若不支持位运算**：降级为"纯 torch NPU 位打包"
     （`view(ushort).view`、移位、`&3` → 全为 torch 成熟算子），内核只剩量化/打包两步，仍纯 NPU。
-  - **无成熟先例②：混合模型里"原生 K/V 双视图 + 组合 160B 槽"组合视图**；机制相似物 =
+  - **无成熟先例②：混合模型里"原生 K/V 双视图 + 逻辑 160B 槽拆分落位"**；机制相似物 =
     TurboQuant packed-slot 单张量（`TQFullAttentionSpec`, `kv_cache_interface.py:327-349`）+
     C8 类外科手术（`kv_c8.py:130`），但二者组合无 direct 先例。验证：L2 沙盒回放 + probe
     字节级对账（每个物理块首尾 16B 与偏移公式对照）。
@@ -201,59 +201,69 @@ L5 算子栈（python → triton JIT → triton-ascend backend → NPU）
 | `oscar_ascend/kernels/decode_kernel.py` | `@triton.jit` fused INT2 decode（stage1 + stage2 复用 vllm `_fwd_kernel_stage2`，port `triton_oscar_decode.py:24-150/253-354`） | backend.forward | 新建 |
 | `oscar_ascend/kernels/dequant_kernel.py` | `@triton.jit` 前缀反量化 → `[cached_len, Hk, D]` fp16（rotated space，port `:357-411`） | backend._prefill_attention | 新建 |
 | `oscar_ascend/tests/test_numeric.py` | CPU 镜像：store 字节差=0 / dequant≤1e-5 / decode≤1e-4 | CI / 本地门禁 | 新建 |
-| `delivery/install_and_launch.sh` | 一键：自检→安装 wheel→指纹心跳→probe（阻塞）→serve | 用户唯一命令 | 新建 |
-| `delivery/serve_oscar.sh` | 用户目标启动命令 + `VLLM_PLUGINS=oscar_ascend` + 环境固化 | install_and_launch.sh 阶段5 | 新建 |
-| `delivery/probe_oscar.py` | 真机同判据数值 probe（store/dequant/decode 三查 + 指纹） | install_and_launch.sh 阶段4 | 新建 |
+| `tools/gen_rotations.py` | 真机离线旋转检查点生成（LLM 跑样例 → Attention 入口 hook 捕获 K/V → 每层协方差 eigh → `.pt`；NPU 优先/CPU 回退+警告） | install_and_launch.sh 阶段4 | 新建 |
+| `delivery/install_and_launch.sh` | 一键：自检→安装 wheel→指纹心跳→生成 pt→probe（阻塞）→serve | 用户唯一命令 | 新建 |
+| `delivery/serve_oscar.sh` | 用户目标启动命令 + `VLLM_PLUGINS=oscar_ascend` + 环境固化 | install_and_launch.sh 阶段6 | 新建 |
+| `delivery/probe_oscar.py` | 真机同判据数值 probe（store/dequant/decode 三查 + triton↔ref 字节一致性） | install_and_launch.sh 阶段5 | 新建 |
+| `README.md` | 快速使用（真机一键 + 参数表 + 诚实边界） | 用户 | 新建 |
 | `pyproject.toml` | `[project.entry-points."vllm.general_plugins"] oscar_ascend = "oscar_ascend.plugin:load_plugin"`（插件加载语义 `vllm/plugins/__init__.py:58-80`：`load()` 返回 callable 并执行） | pip | 新建 |
 
 ---
 
 ## 5. 关键机制/重要方法（做什么 + 为什么这样设计 + 参考）
 
-### 5.1 槽布局（160B，meta-first，N-01 契约；仅 FULL 层 K/V）
+### 5.1 槽布局（逻辑 160B，meta-first，N-01 契约；仅 FULL 层 K/V）
+
+> 实现细化（2026-09-04，实施期确认）：**不构造超界 as_strided 组合视图**，改为
+> **拆分物理落位**——K/V 各用原生 512B 槽的前 96B/64B，逻辑槽拼接后与 N-01
+> 逐字节一致（见下），避免 as_strided 越出 k8 numel 的边界风险（原 5.2 方案作废）。
 
 ```
-每 (block b, token t, head h) 组合槽 = 1024B 原生窗口（K 512B + V 512B，物理连续）
-逻辑布局（槽窗口偏移，单位 B）：
+每 (block b, token t, head h)：原生 K 槽 512B + 原生 V 槽 512B（物理上前后紧邻）
+逻辑 160B 槽 = K 槽前 96B ⊕ V 槽前 64B，字节偏移与 N-01 完全一致：
+
+K 槽（k8, 偏移单位 B）：
   [0..1]   K scale  (fp16 LE, 量化时先 fp16 舍入)
   [2..3]   K zero   (fp16 LE, == vmin)
   [4..5]   V scale  (fp16 LE)
   [6..7]   V zero   (fp16 LE)
-  [8..31]  pad 24B（对齐 32B；槽窗 1024B，pad 只占逻辑槽；N-01 注明 160=5×32 天然 32B 对齐）
+  [8..31]  pad 24B（对齐 32B；160=5×32 天然 32B 对齐，N-01）
   [32..95] K idx 64B（D=256 INT2, 4 值/字节, 字节 b=k idx[4b]|k idx[4b+1]<<2|...）
-  [96..159] V idx 64B（同打包）
-  [160..1023] 未使用（原生窗剩余；保证 stride/几何不变时留白）
+  [96..511] 未使用
+V 槽（v8, 偏移单位 B）：
+  [0..63]  V idx 64B（同打包；拼接后 = 逻辑槽 [96..159]）
+  [64..511] 未使用
 ```
 
-物理地址（全部字节、uint8 视图）：
+物理地址（全部字节、uint8 视图；取实际 stride，兼容 kernel 块重切片 bs=128 与
+hybrid 双网格——见 L-20260831-01：slot_mapping/block_table 均为 kernel 粒度 token 单位）：
 
 ```
-comb_block_stride = k_cache.stride(0)*2            # 字节；hybrid 时= padded 页跨距（N-06）
-comb_pos_stride   = k_cache.stride(1)*2            # = Hk*1024（bs 可能被 128 重新切片，取实际 stride）
-comb_head_stride  = k_cache.stride(2)*2            # = 1024
-slot_base(b,t,h)  = b*comb_block_stride + t*comb_pos_stride + h*comb_head_stride
+k_block_stride = k8.stride(0)   # 字节（= paged 页跨距 N-06）
+k_pos_stride   = k8.stride(1)   # = Hk*512
+k_head_stride  = k8.stride(2)   # = 512
+k_slot_base(b,t,h) = b*k_block_stride + t*k_pos_stride + h*k_head_stride
+v_* 同上（v8 独立张量的 stride；v_slot_base 与 k_slot_base 同构）
 ```
 
-判定不变量：`comb_block_stride == page_size_bytes(每物理块 K+V 字节)`；
-`slot_base 偏移 == 原生 bf16 K/V 写入同一 (b,t,h) 的偏移` → 页表/前缀命中/重写全部天然兼容。
+判定不变量：`k_block_stride == 每物理块 K 区字节数`；`k_slot_base` 等于原生 bf16 K
+写入同一 (b,t,h) 的偏移 → 页表/前缀命中/重写全部天然兼容。
 
-### 5.2 组合视图构造（k/v 连续性的来源）
+### 5.2 双视图落位（不拼接，只按 (k8, v8) 双指针写读）
 
 ```python
-k8 = k_cache.view(torch.uint8)                 # (nb, bs, hk, 512)
-v8 = v_cache.view(torch.uint8)                 # (nb, bs, hk, 512)；与 k8 在组张量内连续
-comb = k8.as_strided(size=(nb, bs, hk, 1024),
-                     stride=(k8.stride(0), k8.stride(1), k8.stride(2), 1))
+k8 = k_cache.view(torch.uint8)   # (nb, bs, hk, 512)
+v8 = v_cache.view(torch.uint8)   # (nb, bs, hk, 512)
 # 依据：hybrid 切分 raw_kv_tensor = raw[conv_pad:] 后 k=v 前段、v=后段（model_runner_v1.py:4575-4577）
-# 注意：若后续版本 K/V 切分不再连续（或 MLA/稀疏路径），此 as_strided 会越界——
-#       实现时对 k8.data_ptr()+k8.numel() 与 v8.data_ptr() 做连续性断言（probe 校验）
+# 注意：store/decode 内核同时接收 k8/v8（PR store 内核同构：Key_ptr/Value_ptr 双入口）
+# 运行时一致性断言（probe 校验）：v8 数据指针 - k8 数据指针 == k8.numel()（物理紧邻）
 ```
 
 ### 5.3 量化/打包（Triton store 伪代码，port PR `triton_oscar_store.py:41-77`，槽位序按 5.1）
 
 ```python
 @triton.jit
-def _store_int2_vec(rot_ptr, comb_ptr, base, slot_base, d_offs, d_mask,
+def _store_int2_vec(rot_ptr, kv8_ptr, base, slot_base, d_offs, d_mask,
                     D: tl.constexpr, LEVELS: tl.constexpr, DATA_BYTES: tl.constexpr,
                     BLOCK_D: tl.constexpr, BLOCK_PACK: tl.constexpr):
     vec = tl.load(rot_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
@@ -271,15 +281,15 @@ def _store_int2_vec(rot_ptr, comb_ptr, base, slot_base, d_offs, d_mask,
     #    （V 区的量化调用同一 helper，rot_ptr 指向 v_rot 基址）
 ```
 
-Python 入口：`oscar_store(k_rot[N,H,D], v_rot[N,H,D], comb, slot_mapping, config)`；
-grid=(N*H,)，slot 基址由 `slot_mapping`（`(block,pos)`）与 `comb` stride 计算（同 PR `:99-112`）。
+Python 入口：`oscar_store(k_rot[N,H,D], v_rot[N,H,D], k8, v8, slot_mapping, config)`；
+grid=(N*H,)，slot 基址由 `slot_mapping`（`(block,pos)`）与 k8/v8 stride 计算（同 PR `:99-112`）。
 
 ### 5.4 读取路径（三种状态）
 
 **decode（fused INT2）**：port `triton_oscar_decode.py:24-150`（stage1：INT2 解包+按块 table
 分块打分+KV 线程拆分 LSE）+ `:153-250` stage2 复用 vllm `_fwd_kernel_stage2`；Q 已旋转
-`Q@R_k`，输出在 rotated-V 空间，回乘 `R_v^T`。组合槽解包：meta 在 `slot_base+0..7`
-（K 0-3, V 4-7），idx 在 `+32..95`/`+96..159`。
+`Q@R_k`，输出在 rotated-V 空间，回乘 `R_v^T`。槽解包：K 槽 meta 在 `+0..7`
+（K 0-3, V 4-7），K idx 在 `+32..95`；V 槽 idx 在 `+0..63`。
 
 **prefill（首块）**：不解缓存；对原始 q/k/v 走原生 `npu_fused_infer_attention_score` /
 `npu_fusion_attention`（TND，`attention_v1.py:1302-1316/1397-1406` 的 API 形态——
@@ -317,7 +327,7 @@ def _patched_init(self, *a, **kw):
 
 | 点 | PR（vllm 原生） | 本方案（vllm-ascend） | 理由 |
 |---|---|---|---|
-| 缓存形状 | `(nb,bs,hk,slot)` 单张量 | `(k,v)` 双张量 + 组合视图 | hybrid 分配几何不可动（§3 A） |
+| 缓存形状 | `(nb,bs,hk,slot)` 单张量 | `(k,v)` 双张量 + 拆分槽（逻辑 160B） | hybrid 分配几何不可动（§3 A） |
 | 更新时机 | `forward_includes_kv_cache_update=False` + `do_kv_cache_update` | 保持 `True`（backend 原生未改），在 `forward` 内做 store | 不动 backend 类 |
 | 预填充注意力 | flash_attn_varlen | `npu_fused_infer_attention_score`/`npu_fusion_attention`（TND） | Ascend 原生命令（`attention_v1.py:1302-1316/1397-1406`） |
 | 槽字节序 | PR 每区 [data\|meta]，D=256 136B | N-01 meta-first 160B（含 pad） | 用户规定 tq_slot_size=160 + 沙盒数值契约唯一权威（N-01） |
@@ -360,13 +370,13 @@ def _patched_init(self, *a, **kw):
 
 | # | TODO | 完成判定（可观察现象/命令/判据） | 状态 |
 |---|---|---|---|
-| 1 | `format.py` + 纯函数参考实现（160B 槽、量化、打包、解包） | `python tests/test_numeric.py` → store 字节差=0、dequant≤1e-5（与 skill sandbox l3_numeric 对账） | [ ] |
-| 2 | `rotation.py` + config（env 解析、单位阵回退） | 单测：构造 {i: eye} 检查点 → `get_layer_rotation` 返回 `[D,D]`；缺层→单位阵 | [ ] |
-| 3 | Triton store kernel + 组合视图 | `test_numeric` 增加 kernel 路径（`HAS_TRITON` 下）→ 同判据；**无 Triton 时用 torch 参考路径** | [ ] |
-| 4 | Triton decode（stage1/2 + 反旋）+ dequant kernel | CPU 数值镜像 decode≤1e-4；`triton` 冒烟编译无异常 | [ ] |
-| 5 | `AscendOscarAttentionBackendImpl` + plugin.py（类外科手术 + 心跳 + fail-soft） | 构造 fake impl `__class__` 生效；非 hybrid 模型回退原生；插件心跳计数 ≥1 | [ ] |
-| 6 | 窗口 staging（sink/recent + LSE 合并）port | CPU 镜像：窗口外 token 与 INT2 一致、窗口内等于 BF16；恢复 | [ ] |
-| 7 | `delivery/install_and_launch.sh` + `serve_oscar.sh` + `probe_oscar.py` | 一条命令跑通（自检→安装→probe PASS→serve 起来）；`VLLM_PLUGINS=oscar_ascend` 心跳在日志 | [ ] |
+| 1 | `format.py` + 纯函数参考实现（160B 槽、量化、打包、解包） | `python tests/test_numeric.py` → store 字节差=0、dequant≤1e-5（与 skill sandbox l3_numeric 对账） | [x] 2026-09-04 6/6 PASS |
+| 2 | `rotation.py` + config（env 解析、单位阵回退） | 单测：构造 {i: eye} 检查点 → `get_layer_rotation` 返回 `[D,D]`；缺层→单位阵 | [x] 2026-09-04（rotation.v 字段扩展 + 单位阵回退已实现） |
+| 3 | Triton store kernel + 拆分槽落位 | `test_numeric` 增加 kernel 路径（`HAS_TRITON` 下）→ 同判据；**无 Triton 时用 torch 参考路径** | [x] 2026-09-04（torch ref 全绿；triton 待真机 probe） |
+| 4 | Triton decode（stage1/2 + 反旋）+ dequant kernel | CPU 数值镜像 decode≤1e-4；`triton` 冒烟编译无异常 | [x] 2026-09-04（ref 路径全绿；triton 冒烟=真机 probe） |
+| 5 | `AscendOscarAttentionBackendImpl` + plugin.py（类外科手术 + 心跳 + fail-soft） | 构造 fake impl `__class__` 生效；非 hybrid 模型回退原生；插件心跳计数 ≥1 | [x] 2026-09-04（代码交付；真机构造验证=probe 后心跳日志） |
+| 6 | 窗口 staging（sink/recent + LSE 合并）port | CPU 镜像：窗口外 token 与 INT2 一致、窗口内等于 BF16；恢复 | [x] 2026-09-04（代码 port 完成；NPU 行为=R5 待真机） |
+| 7 | `delivery/install_and_launch.sh` + `serve_oscar.sh` + `probe_oscar.py` | 一条命令跑通（自检→安装→probe PASS→serve 起来）；`VLLM_PLUGINS=oscar_ascend` 心跳在日志 | [x] 2026-09-04（脚本+gen_rotations 交付；现场跑通=TODO8） |
 | 8 | 真机 single-token 数值 probe（D=256） | probe：store 字节差=0、dequant≤1e-5、decode vs bf16 参考 ≤1e-4 全 PASS；**FAIL 阻断 serve** | [ ] |
 | 9 | 精度/显存回归（用户目标命令 serve） | `--max-model-len 262144` 拉起；greedy 采样与 bf16 基线在测试集差异 ≤ 阈值；npu-smi KV 占用下降≈84% | [ ] |
 | 10 | `handoff_hygiene`/CI 类收尾（如项目要求）+ 文档标记 REVIEWED | 门禁命令全绿；plan README 状态改 REVIEWED | [ ] |
@@ -391,7 +401,7 @@ def _patched_init(self, *a, **kw):
 | "改 page_size 就能省显存" | hybrid 组张量按 mamba 页对齐（page_size_padded），改 attention 页大小会触发 4493/4569 分支重算切分 | 不动几何；160B 槽嵌原生 1024B 窗，省的是带宽/读写字节，不是页表 | `model_runner_v1.py:5025-5034`；§3 B 否决 |
 | "量化公式先取 scale 再舍零" | 舍入顺序影响 bin 边界（1 电平差） | 严格 N-02：scale/zero 先 fp16 舍入，再量化 | `triton_oscar_store.py:50-56`；N-02 |
 | "反量化用 1/scale 乘" | 1 ulp 差可在 0.5 边界翻转 | 直除 | N-08 |
-| "PR 的 get_kv_cache_shape 直接搬" | Ascend hybrid 需要 5 维 `(2,nb,bs,hk,d)` 原生形状才能走通切分 | 保持原生 backend 形状；组合槽在 impl 层 as_strided | `attention_v1.py:104-112`；§3 A |
+| "PR 的 get_kv_cache_shape 直接搬" | Ascend hybrid 需要 5 维 `(2,nb,bs,hk,d)` 原生形状才能走通切分 | 保持原生 backend 形状；拆分槽在 impl 层按 (k8,v8) 双指针落位 | `attention_v1.py:104-112`；§3 A |
 | "位打包一定能在 Triton-Ascend 跑" | triton-ascend 后端覆盖不全 | 门禁 HAS_TRITON + 冒烟 + torch 降级 | R2/R3 |
 | "Sink/Recent 分区做在页内" | 页内分区需每块动态三段边界，页表/前缀命中全部牵动 | 采用 PR staging arena（页外 NPU 缓冲区 + owner tag） | `oscar_attn.py:245-336` |
 
@@ -401,7 +411,7 @@ def _patched_init(self, *a, **kw):
 |---|---|
 | FULL 层 | Qwen3.5 混合模型中执行全注意力（self_attn）的层；GDN 层执行线性注意力（linear_attn） |
 | 三大条 | vllm-ascend hybrid 每个组张量内的三连续区：条A conv、条B (ssm或K)、条C V（用户 §1 术语，本文沿用） |
-| 组合槽视图 | 把原生 K 视图与 V 视图（物理连续）合并成 `(nb,bs,hk,1024)` uint8 的 as_strided 视图 |
+| 拆分槽落位 | 逻辑 160B 槽按 K 槽前 96B（meta+pad+K idx）+ V 槽前 64B（V idx）写入原生 k8/v8 双视图，不拼接 |
 | staging arena | OSCAR 的 BF16 Sink/Recent 环形缓冲（带 owner tag 防错配），页外分配 |
 | LSE 合并 | 两个部分注意力（INT2 中段 + BF16 窗口）按 log-sum-exp 权重合并 |
 | tq_slot_size | TurboQuant 的"每 token 每 KV 头字节数"语义；本方案逻辑槽 = 160B |
@@ -410,9 +420,10 @@ def _patched_init(self, *a, **kw):
 
 ## 11. 当前状态与更新记录
 
-- 状态：DRAFT；下一步 = TODO 1（format.py + 纯函数参考实现与 sandbox 对账）。
+- 状态：IMPLEMENTED（本地门禁全绿）；真机验收 = TODO 8-9。
 - 更新记录：
 
 | 日期 | 变化 | 证据/commit |
 |---|---|---|
 | 2026-09-03 | 初稿：候选 A 选定 + 数值契约/旋转/窗口/接缝全表 | 本文件 + references/ 树 file:line（§6） |
+| 2026-09-04 | 实施：插件全套落地（format/config/rotation/kernels/backend/plugin + 一键脚本 + gen_rotations + 测试 6/6 PASS）；拆分槽落位替代 as_strided 组合视图（§5.1/5.2） | 本地 CPU 镜像全绿；triton/真机待 probe（TODO 8） |
