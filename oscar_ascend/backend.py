@@ -140,8 +140,11 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens],
             )
             if self._oscar.window_enabled:
-                self._ensure_staging(layer, kv_cache)
-                self._staging_write(layer, key, value, attn_metadata)
+                try:
+                    self._ensure_staging(layer, kv_cache)
+                    self._staging_write(layer, key, value, attn_metadata)
+                except Exception as e:  # pragma: no cover — 窗口是精度增益，失败降级纯 INT2
+                    print(f"[oscar-ascend] 窗口 staging 跳过（降级纯 INT2）: {e}")
 
         # 2) 读路径
         if state == getattr(AscendAttentionState, "DecodeOnly", None):

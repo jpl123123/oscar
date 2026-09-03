@@ -75,10 +75,26 @@ def main() -> int:
 
         return _hook
 
-    model_mod = llm.model.model
-    layers = getattr(model_mod, "layers", None)
-    if layers is None:
-        layers = getattr(model_mod, "model", None).layers
+    def _find_layers(mod):
+        """递归定位 base decoder layers（Qwen3.5 结构可能包一层 language_model/model）。"""
+        for attr in ("layers",):
+            sub = getattr(mod, attr, None)
+            if sub is not None and len(sub) > 0:
+                return sub
+        for attr in ("language_model", "model", "transformer", "language_model.model"):
+            sub = mod
+            ok = True
+            for part in attr.split("."):
+                sub = getattr(sub, part, None)
+                if sub is None:
+                    ok = False
+                    break
+            if ok and hasattr(sub, "layers") and len(sub.layers) > 0:
+                return sub.layers
+        raise SystemExit("未找到模型 decoder layers（结构不符，请检查模型类）")
+
+    model_mod = llm.model.model if hasattr(llm.model, "model") else llm.model
+    layers = _find_layers(model_mod)
     for i, layer in enumerate(layers):
         attn = getattr(layer, "self_attn", None)
         module = getattr(attn, "attn", None)
