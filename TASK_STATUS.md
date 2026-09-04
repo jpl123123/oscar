@@ -27,6 +27,9 @@
 7. **校准捕获 2D/3D 形状契约（真机 03:43 全 worker IndexError）**：vllm `Attention.forward`
    入口为 2D `[N,H*D]`（attention.py:483-488 内部才 view 3D）→ 钩子按模块
    `num_heads/num_kv_heads/head_size` 还原 3D（R-20260904-calib-capture-2d）。
+8. **校准依赖的设备/精度契约（真机 05:02 设备混用 + ERR01002）**：协方差累加器必须绑定
+   捕获设备且用 fp32（torch-npu 不支持 float64）；gen_rotations 的 eigh/组合改父进程
+   CPU fp64 固定执行（R-20260904-calib-device-dtype）。
 1. **旋转检查点非已验证配方**（最大杠杆）：旧 gen_rotations 只存特征向量 U（降序）；
    论文/PR 默认验证 = **R = U @ H @ P_br**（Hadamard + 位反置换，`compute_kv_rotation.py:234-265`）
    → 修复：`tools/gen_rotations.py` 移植组合，`format_version=2`。

@@ -124,22 +124,20 @@ def compose_rotation(rotation: torch.Tensor, eigvals: torch.Tensor, hadamard: to
     return rotation @ hadamard @ pbr
 
 
-def _rotation_from_stats(stats: dict, D: int, dev: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """hessian 协方差 → (R = U·H·P_br, eigenvalues)（fp64 计算后转 fp32）。"""
+def _rotation_from_stats(stats: dict, D: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """hessian 协方差 → (R = U·H·P_br, eigenvalues)。
+
+    一律在 **父进程 CPU fp64** 完成（离线一次性、256×256 小矩阵；真机 05:02 教训：
+    torch-npu 不支持 float64 → 任何 NPU 侧 fp64 计算都可能触发 ERR01002，纯属风险）。
+    """
     c = max(1, int(stats["count"]))
     cov = stats["cov_sum"] / c
     eps = 1e-6 * torch.eye(D)
     cov64 = (cov.double() + cov.double().T) / 2
     try:
-        evals, evecs = torch.linalg.eigh((cov64 + eps.double()).to(dev))
+        evals, evecs = torch.linalg.eigh(cov64 + eps.double())
     except Exception as e:
-        print(
-            f"[gen-rotations] ⚠️ NPU eigh 不可用，CPU 回退（离线校准，非热路径）: {e}"
-        )
-        try:
-            evals, evecs = torch.linalg.eigh(cov64 + eps.double())
-        except Exception as e2:
-            raise RuntimeError(f"eigh 失败（cov 含 NaN?）: {e2}") from e2
+        raise RuntimeError(f"eigh 失败（cov 含 NaN?）: {e}") from e
     H = build_hadamard(D)
     rot = compose_rotation(evecs, evals, H)
     err = (rot @ rot.T - torch.eye(D, dtype=torch.float64)).abs().max().item()
@@ -157,10 +155,9 @@ def main() -> int:
     args = ap.parse_args()
 
     on_npu = _npu()
-    dev = "npu" if on_npu else "cpu"
-    # CPU 压力控制：父进程只做一次性合并+eigh（NPU 不支持 eigh → CPU 回退），限 4 线程
+    # CPU 压力控制：父进程只做一次性合并+eigh+组合（CPU 限 4 线程）
     torch.set_num_threads(min(4, max(1, torch.get_num_threads())))
-    print(f"[gen-rotations] device={dev} seq_len={args.max_len} cpu_threads={torch.get_num_threads()}")
+    print(f"[gen-rotations] npu_available={on_npu} seq_len={args.max_len} cpu_threads={torch.get_num_threads()}")
 
     if not _force_ascend_platform():
         print("[gen-rotations] ❌ 平台未激活。请运行 python3 tools/diag_platform.py 并回传输出。")
@@ -215,9 +212,9 @@ def main() -> int:
             print(f"  ⏭️ 跳过无法解析层号的键: {layer}")
             continue
         lid = int(m.group(1))
-        # K 旋转 ← Σ_Q（qqt）；V 旋转 ← Σ_S（sst）；组合 R = U·H·P_br
-        r_k, e_k = _rotation_from_stats(st["q"], D, dev)
-        r_v, e_v = _rotation_from_stats(st["v"], D, dev)
+        # K 旋转 ← Σ_Q（qqt）；V 旋转 ← Σ_S（sst）；组合 R = U·H·P_br（父进程 CPU fp64）
+        r_k, e_k = _rotation_from_stats(st["q"], D)
+        r_v, e_v = _rotation_from_stats(st["v"], D)
         layers_out[str(lid)] = {   # 键 = 层号字符串（rotation._load_checkpoint 按 int/lid 索引）
             "layer_id": lid,
             "rotation": r_k,

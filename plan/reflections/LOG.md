@@ -21,3 +21,10 @@
 - 2026-09-04 13:01 | STEP R-FIX | record=plan/reflections/R-20260904-calib-capture-2d.md | calib 钩子 2D→3D 还原（模块头参数）+ mtp 跳过 + finalize 防御；tests 更新
 - 2026-09-04 13:01 | STEP R-GATES | record=plan/reflections/R-20260904-calib-capture-2d.md | py_compile OK；tests 16/16 PASS
 - 2026-09-04 13:01 | EXIT RESOLVED | record=plan/reflections/R-20260904-calib-capture-2d.md | 修复=钩子按模块头参数还原 3D+finalize 防御；真机复跑一键预期校准通过并产出 v2 pt
+- 2026-09-04 13:12 | ENTER 反思模式 | record=plan/reflections/R-20260904-calib-device-dtype.md | trigger=真机校准失败：calib.py:135 cov_q += qtq → RuntimeError Expected all tensors to be on the same device + ERR01002 OPS invalid type（4 worker 全挂）
+- 2026-09-04 13:14 | STEP Q1 | record=plan/reflections/R-20260904-calib-device-dtype.md | 根因=累加器 torch.zeros(dtype=float64) 默认 CPU + 捕获张量在 NPU → cov_q+=qtq 设备混用；torch-npu 不支持 fp64（ERR01002 次因）；本地 CPU 测试全绿正好掩盖
+- 2026-09-04 13:14 | STEP Q2 | record=plan/reflections/R-20260904-calib-device-dtype.md | GAP-FIXTURE（附注：可提议新类 GAP-DEVICE）：本地运行时环境=CPU，默认设备恰等于数据设备、fp64 恰可用 → 设备/dtype 契约不可见
+- 2026-09-04 13:14 | STEP Q3 | record=plan/reflections/R-20260904-calib-device-dtype.md | t_calib 增 RPC 载荷 CPU/fp32 断言 + 源码守卫（禁 float64、必含 device=dev）；旧代码 FAIL/新代码 PASS
+- 2026-09-04 13:14 | STEP R-FIX | record=plan/reflections/R-20260904-calib-device-dtype.md | calib 累加器 device=dev+fp32+末尾 .cpu()；删死代码；gen_rotations 父进程 CPU fp64 eigh（移除 NPU 尝试）
+- 2026-09-04 13:14 | STEP R-GATES | record=plan/reflections/R-20260904-calib-device-dtype.md | py_compile+bash -n OK；tests 16/16 PASS
+- 2026-09-04 13:14 | EXIT RESOLVED | record=plan/reflections/R-20260904-calib-device-dtype.md | 修复=设备绑定 fp32 累加+CPU fp64 特征分解；真机复跑一键预期校准通过产出 v2 pt

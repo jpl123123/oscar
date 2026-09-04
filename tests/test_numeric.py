@@ -419,8 +419,18 @@ def t_calib_cov_q_sst():
     cov_q, cov_v = st["q"]["cov"], st["v"]["cov"]
     assert cov_q.shape == (32, 32) and (cov_q - cov_q.T).abs().max() < 1e-5
     assert (cov_v - cov_v.T).abs().max() < 1e-5
+    # RPC 契约（真机 05:02 教训）：返回必须 CPU fp32；calib 禁止 fp64（torch-npu 不支持）
+    assert cov_q.device.type == "cpu" and cov_q.dtype == torch.float32, \
+        f"RPC 载荷必须为 CPU fp32: {cov_q.device}/{cov_q.dtype}"
     plain_v = (cap["v"][0].reshape(-1, 32).T @ cap["v"][0].reshape(-1, 32)) / 64
     assert not torch.equal(cov_v, plain_v), "sst 权重未生效（Σ_S == Σ_V）"
+
+    # 静态契约守卫：calib 内禁止 float64 累加、累加器必须显式绑定捕获设备
+    import pathlib
+
+    src = pathlib.Path("oscar_ascend/calib.py").read_text(encoding="utf-8")
+    assert "torch.float64" not in src, "calib 禁止 fp64（torch-npu 不支持 → ERR01002）"
+    assert "device=dev" in src, "累加器必须绑定捕获设备（真机 05:02 设备混用）"
 
     # MTP 草稿层不应被捕获（与 plugin._should_oscar 同一策略）
     mtp = FakeAttn()

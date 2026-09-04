@@ -98,7 +98,7 @@ def finalize_cov(model=None) -> dict:
       compute_kv_rotation.py:93-108 / README:312）；
       Σ_S = (1/H_kv) Σ_h (V_h·√w)^T(V_h·√w)/n，w_i=(k_i^T Σ_Qh k_i) —— V 旋转的
       score-weighted（sst 目标，compute_kv_rotation.py:111-136）。
-    张量已 CPU。
+    计算在捕获设备（NPU/fp32）上完成；返回张量已 CPU（RPC 安全）。
     """
     out = {}
     for layer_name, d in _captures.items():
@@ -122,11 +122,14 @@ def finalize_cov(model=None) -> dict:
         def _sym(x: torch.Tensor) -> torch.Tensor:
             return (x + x.T) / 2
 
-        def _eigh_dims_stats(x: torch.Tensor) -> torch.Tensor:
-            return _sym(x.float().reshape(-1, x.shape[-1]).t() @ x.float().reshape(-1, x.shape[-1]) / x.shape[0])
-
-        cov_q = torch.zeros(q.shape[-1], q.shape[-1], dtype=torch.float64)
-        cov_s = torch.zeros(v.shape[-1], v.shape[-1], dtype=torch.float64)
+        # 设备/精度契约（真机 05:02 教训）：捕获张量在 NPU（fp32），累加器必须
+        # **同设备同 dtype** —— 不能 torch.zeros(默认 CPU + float64)：
+        #   ① 默认 CPU 累加 NPU → "Expected all tensors to be on the same device"；
+        #   ② torch-npu 不支持 float64 → ERR01002 OPS invalid type。
+        # 结果最后 .cpu() 上传（最小 RPC 载荷；父进程合并/特征分解全在 CPU）。
+        dev = q.device
+        cov_q = torch.zeros(q.shape[-1], q.shape[-1], device=dev, dtype=torch.float32)
+        cov_s = torch.zeros(v.shape[-1], v.shape[-1], device=dev, dtype=torch.float32)
         for h in range(n_hk):
             qg = q[:, h * g : (h + 1) * g, :].float().reshape(-1, q.shape[-1])
             kh = k[:, h, :].float()
@@ -140,7 +143,7 @@ def finalize_cov(model=None) -> dict:
         cov_q = cov_q / n_hk
         cov_s = cov_s / n_hk
         out[layer_name] = {
-            "q": {"cov": cov_q.cpu(), "count": n},
-            "v": {"cov": cov_s.cpu(), "count": n},
+            "q": {"cov": cov_q.detach().cpu(), "count": n},
+            "v": {"cov": cov_s.detach().cpu(), "count": n},
         }
     return out
