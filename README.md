@@ -53,6 +53,24 @@ OSCAR_EXTRA_ARGS="--enforce-eager" bash delivery/serve_oscar.sh    # 建议：OS
 OSCAR_SKIP_INSTALL=1 bash delivery/install_and_launch.sh           # 复用容器内已装插件
 ```
 
+## 如何证明 OSCAR 真的进入了 serve 实例（必读）
+
+```bash
+bash delivery/check_oscar_active.sh            # 自动取最新 serve 日志并判定
+```
+
+判定项（内置 ★ 自证日志，`cb4fc15+`）：
+- `[oscar-ascend] plugin 注入 OK` —— 插件在 process0/engine/worker 均加载；
+- `★ 类外科手术生效: model.layers.N.self_attn.attn → AscendOscarAttentionBackendImpl ...`
+  —— FULL 层 impl 被替换（应恰 16 条）；GDN 层不应出现；
+- `★ OSCAR 配置生效 ...` / `★ INT2 写路径首次执行 ...` / `★ INT2 读路径(decode) 首次执行 ...`。
+
+**若判 NOT-ACTIVE**：99% 是服务不是由本仓库脚本拉起（例如直接 `vllm serve`，环境
+`VLLM_PLUGINS=ascend,oscar_ascend` 未注入）。请统一用：
+`bash delivery/install_and_launch.sh`（或 `OSCAR_ASCEND_ENABLE=auto bash delivery/serve_oscar.sh`），
+随后再跑 check 一次。**注意：日志里的 `GPU KV cache usage %` 是池占用率而非字节数；
+OSCAR 在字节 IO 层降带宽（160B vs 1024B/token·head），引擎可见分配不变（候选 A 取舍）。**
+
 ## 本地门禁（开发机，无 NPU）
 
 ```bash
