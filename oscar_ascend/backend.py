@@ -42,6 +42,16 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         self._oscar_use_triton = (
             self._oscar_cfg.use_triton and _k_triton is not None
         )
+        # ★ 自证点 2：配置生效摘要（每层首次 setup 打一次）
+        print(
+            f"[oscar-ascend] ★ OSCAR 配置生效: D={self.head_size}, 逻辑槽=160B "
+            f"(K 96B+V 64B), K旋转={'已加载' if self._oscar_cfg.k_rotation_path else '单位阵(未加载)'}, "
+            f"V旋转={'已加载' if self._oscar_cfg.v_rotation_path else '单位阵(未加载)'}, "
+            f"路径={self._oscar_cfg.k_rotation_path or '-'}, "
+            f"triton={'启用' if self._oscar_use_triton else 'torch参考路径'}, "
+            f"窗口(sink={self._oscar_cfg.sink_tokens}, recent={self._oscar_cfg.recent_tokens})"
+        )
+        self._oscar_stats = {"writes": 0, "kv_bytes_written": 0, "reads": 0}
 
     @property
     def _oscar(self) -> OscarAscendConfig:
@@ -85,6 +95,16 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         rk, rv = self._layer_rots(layer, k.device)
         k_rot = self._rotate_clip(k, rk, self._oscar.k_clip_ratio)
         v_rot = self._rotate_clip(v, rv, self._oscar.v_clip_ratio)
+        if not getattr(layer, "_oscar_wrote_once", False):
+            layer._oscar_wrote_once = True
+            # ★ 自证点 3：INT2 写路径真实执行（每层首写一次日志 + 字节统计）
+            print(
+                f"[oscar-ascend] ★ INT2 写路径首次执行: {layer.layer_name} "
+                f"tokens={N} heads={Hk} — 每 token·head IO {160}B (原生 {2 * D}B, "
+                f"写入开销 -{(1 - 160 / (2 * D)) * 100:.1f}%)"
+            )
+        self._oscar_stats["writes"] += 1
+        self._oscar_stats["kv_bytes_written"] += N * Hk * 160
         if self._oscar_use_triton:
             try:
                 from .kernels.store_kernel import oscar_store_triton
@@ -160,6 +180,14 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
 
     # ------------------------------------------------------------------ decode
     def _decode_attention(self, query, kv_cache, attn_metadata, layer) -> torch.Tensor:
+        if not getattr(layer, "_oscar_read_once", False):
+            layer._oscar_read_once = True
+            self._oscar_stats["reads"] += 1
+            print(
+                f"[oscar-ascend] ★ INT2 读路径(decode) 首次执行: {layer.layer_name} "
+                f"seq_len={int(attn_metadata.seq_lens.max()) if attn_metadata.seq_lens.numel() else 0}, "
+                f"窗口={'开' if self._oscar.window_enabled and self._oscar_stage_ready else '关(纯INT2)'}"
+            )
         if self._oscar.window_enabled and self._oscar_stage_ready:
             return self._decode_attention_windowed(query, kv_cache, attn_metadata, layer)
         q = query.float()

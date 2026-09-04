@@ -110,9 +110,19 @@ def load_plugin() -> None:
 
                 impl.__class__ = OscarImpl
                 impl._oscar_setup()
+                cfg = impl._oscar
                 _HEARTBEAT["loaded"] += 1
+                layer_name = getattr(self, "layer_name", "?")
                 _HEARTBEAT["layers"].append(
-                    f"{getattr(self, 'layer_name', '?')}:heads={impl.num_heads}/kv={impl.num_kv_heads}/d={impl.head_size}"
+                    f"{layer_name}:heads={impl.num_heads}/kv={impl.num_kv_heads}/d={impl.head_size}"
+                )
+                # ★ 自证点 1：OSCAR impl 真实替换成功（FULL 层必有；GDN 层不出现）
+                print(
+                    f"[oscar-ascend] ★ 类外科手术生效: {layer_name} "
+                    f"→ AscendOscarAttentionBackendImpl (Hq={impl.num_heads}, "
+                    f"Hk={impl.num_kv_heads}, D={impl.head_size}, "
+                    f"slot=160B, triton={cfg.use_triton}, "
+                    f"sink={cfg.sink_tokens}/recent={cfg.recent_tokens})"
                 )
             except Exception as e:  # pragma: no cover — fail-soft 回退原生
                 _HEARTBEAT["errors"].append(str(e))
