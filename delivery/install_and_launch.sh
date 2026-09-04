@@ -27,7 +27,10 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 SERVE_LOG="$LOG_DIR/serve_$STAMP.log"
 
 MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
-export VLLM_PLUGINS="${VLLM_PLUGINS:-oscar_ascend}"
+# VLLM_PLUGINS 为跨组白名单（vllm envs.py:1041 逗号分隔、精确匹配）：必须同时包含
+# platform 插件 "ascend" 与我们的 general 插件 "oscar_ascend"——只写后者会把
+# vllm_ascend:register 过滤掉 → 平台未激活（真机 diag [3] 石锤）。
+export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,oscar_ascend}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 fail() { echo "❌ [oscar-ascend] $1" >&2; echo "   日志: $LOG_DIR/*$STAMP*" >&2; exit 1; }

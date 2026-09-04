@@ -63,7 +63,8 @@ python3 tests/test_numeric.py    # CPU 镜像：store 字节差=0 / dequant≤1e
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `OSCAR_ASCEND_ENABLE` | `auto` | `0`=禁用；`auto`=仅 hybrid 模型注入 |
+| `VLLM_PLUGINS` | `ascend,oscar_ascend`（脚本默认） | vllm 插件白名单（逗号分隔、跨组生效）。**必须包含 platform 插件 `ascend`**——只写 `oscar_ascend` 会把 `vllm_ascend:register` 过滤掉导致平台未激活（真机 diag [3]） |
+| `OSCAR_ASCEND_ENABLE` | `auto` | `0`=禁用注入（校准也引导平台）；`auto`=仅 hybrid 模型注入 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | `oscar_rotations.pt` | 旋转检查点（K/V 用 `rotation`/`rotation_v` 字段；缺省→单位阵） |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | `0.0` | 裁剪分位数（>0 走 `torch.quantile`，NPU 未正式验证 → 默认关） |
 | `OSCAR_ASCEND_SINK_TOKENS` / `RECENT_TOKENS` / `STAGING_TOKENS` | `64` / `256` / `8192` | BF16 Sink/Recent 窗口与 staging 容量 |

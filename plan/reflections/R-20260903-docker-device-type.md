@@ -130,3 +130,19 @@ reflect gate（本记录）→ 待跑
   （日志 platform.py:62 先于插件打印），import 安全；非 NPU 环境不覆盖。
 - 本记录保持 OPEN；退出条件：worker 平台引导日志 `平台引导: ... pid=<worker>` +
   校准成功 → probe → serve。
+
+
+## §10 真根因确认（2026-09-04 00:00 diag 数据）—— VLLM_PLUGINS 白名单过滤
+
+- diag [3]：`发现的 platform 插件: []`（尽管 Available 列表打印了 ascend）
+  + [4] `qualname = vllm.platforms.interface.UnspecifiedPlatform` + [5] `device_type=''`
+  + [6] 强制激活成功——完全吻合"发现但被过滤"。
+- 根因：vllm `VLLM_PLUGINS` = 逗号分隔**跨组白名单**（envs.py:1041-1044，精确成员匹配）；
+  我方脚本默认导出 `VLLM_PLUGINS=oscar_ascend` → platform 插件 `ascend` 被过滤 →
+  `load_plugins_by_group(PLATFORM_PLUGINS_GROUP)` 返回空 → 平台未激活。
+- 修复：白名单默认 `ascend,oscar_ascend`（install/serve 脚本 + README）。届时
+  vllm_ascend:register 自动激活，spawn worker 亦自动正确；_bootstrap_platform 保留为
+  兜底（device_type 已 npu 时 no-op）。
+- 保留项：VLLM_WORKER_MULTIPROC_METHOD=spawn（fork 线程池崩溃独立问题，仍有效）。
+- 本记录保持 OPEN；退出条件：平台自动激活（不再依赖强制引导日志）→ 校准成功 →
+  probe → serve。

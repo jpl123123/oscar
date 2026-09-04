@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
 
-export VLLM_PLUGINS="${VLLM_PLUGINS:-oscar_ascend}"
+export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,oscar_ascend}"
 # 真机实测（2026-09-03 12:58）：TP4 多进程 worker 若用 fork 在多线程父进程下触发
 # PyTorch "ParallelOpenMP.cpp:64 Invalid thread pool" 崩溃 → 默认 spawn。
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
