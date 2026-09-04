@@ -17,6 +17,10 @@ export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,oscar_ascend}"
 # 真机实测（2026-09-03 12:58）：TP4 多进程 worker 若用 fork 在多线程父进程下触发
 # PyTorch "ParallelOpenMP.cpp:64 Invalid thread pool" 崩溃 → 默认 spawn。
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+
+# 显式选择 0-3 号卡：npu-smi 显示 4-7 卡被其它作业占满（各 ~26GB），TP4 必须落到空闲卡
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"
+
 export OSCAR_ASCEND_ENABLE="${OSCAR_ASCEND_ENABLE:-auto}"
 export OSCAR_ASCEND_K_ROTATION_PATH="${OSCAR_ASCEND_K_ROTATION_PATH:-$REPO_ROOT/oscar_rotations.pt}"
 export OSCAR_ASCEND_V_ROTATION_PATH="${OSCAR_ASCEND_V_ROTATION_PATH:-$REPO_ROOT/oscar_rotations.pt}"
