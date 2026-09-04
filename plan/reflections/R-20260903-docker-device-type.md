@@ -254,3 +254,14 @@ reflect gate（本记录）→ 待跑
 - serve 启动失败：`serve_oscar.sh: line 41: OSCAR_EXTRA_ARGS: unbound variable`
   （`set -u`）→ 修复 `${OSCAR_EXTRA_ARGS:-}`。
 - 本记录保持 OPEN；退出条件：serve 日志 [oscar-ascend] plugin 注入 OK + 首个请求采样。
+
+
+## §19 后续进展（2026-09-04 01:25 真机日志十三）—— triton 字节差根因
+
+- probe ref 再次全 PASS（0/0/0）；triton 观察模式：编译通过（K_IDX_OFF constexpr 生效），
+  但 `store 字节差 = 9`（判据 0）。
+- 根因（契约/实现对齐）：format.quantize 用 torch.round（银行家舍入），N-02 契约与
+  Triton 内核均为 **floor(x+0.5)**；仅 .5 天平边界差 1 电平 → 少数字节差。
+- 修复：format.quantize 改为 `floor((x-zero)/scale + 0.5)`（N-02 原文）；本地镜像 8/8。
+- serve 已进入启动阶段（日志到"启动 vllm serve"）——待用户回传 serve 段确认
+  plugin 注入 OK / 首个请求。

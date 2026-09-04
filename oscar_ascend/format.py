@@ -66,7 +66,9 @@ def quantize(
     scale_f16 = scale.half().float()
     zero_f16 = vmin.half().float()
 
-    q = torch.clamp(torch.round((x - zero_f16) / scale_f16), 0, LEVELS - 1)
+    # N-02：q = clamp(floor((x-zero)/scale + 0.5), 0, 3) —— floor(+0.5)，与 Triton 内核、
+    # sandbox 契约一致（torch.round 为银行家舍入，仅在 .5 边界差 1 电平 → triton 字节差）
+    q = torch.clamp(torch.floor((x - zero_f16) / scale_f16 + 0.5), 0, LEVELS - 1)
     q = q.to(torch.int32)  # 用 int32 位运算，避免 uint8 位移差异
     q4 = q.reshape(*q.shape[:-1], q.shape[-1] // VALUES_PER_BYTE, VALUES_PER_BYTE)
     shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=x.device)
