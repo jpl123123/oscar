@@ -172,30 +172,24 @@ fi
 # ---------- 阶段6 serve（前台实时输出 + tee 落盘；后台观察者自动判定；不代发请求） ----------
 step "启动 vllm serve（前台实时显示；日志固定 /tmp/oscar_ascend_logs/serve.log 覆盖写入）"
 export OSCAR_ASCEND_LOG_DIR="$LOG_DIR"
-# 后台观察者：等 /health → 自动跑激活判定（打印到同一终端，不打断 serve 前台）
+# 后台观察者：基于日志判定就绪（不对服务发任何 HTTP/curl——请求一律由您的 ais_bench 发起）
 (
     READY=0
     for i in $(seq 1 180); do
         sleep 5
-        if python3 - <<'PYCHECK' 2>/dev/null
-import urllib.request
-try:
-    urllib.request.urlopen("http://127.0.0.1:8989/health", timeout=2)
-except Exception:
-    raise SystemExit(1)
-PYCHECK
-        then READY=1; break; fi
-        # serve 提前退出（端口进程消失且日志显示启动失败）→ 直接报
+        if grep -q "Application startup complete\|Uvicorn running on http://0.0.0.0:8989" "$SERVE_LOG" 2>/dev/null; then
+            READY=1; break
+        fi
         if grep -q "EngineCore failed to start\|WorkerProc failed to start\|NPUModelRunner failed" "$SERVE_LOG" 2>/dev/null; then
-            echo "🚨 [oscar-watch] serve 启动失败（见上方/日志 $SERVE_LOG）"; exit 1
+            echo "🚨 [oscar-watch] serve 启动失败（见下方/日志 $SERVE_LOG）"; exit 1
         fi
     done
     if [ "$READY" -eq 1 ]; then
         echo ""
-        echo "✅ [oscar-watch] serve 就绪（http://0.0.0.0:8989/health）—— 自动激活判定："
+        echo "✅ [oscar-watch] serve 就绪（Uvicorn 8989，日志 $SERVE_LOG）—— 自动激活判定："
         bash delivery/check_oscar_active.sh "$SERVE_LOG"
     else
-        echo "🚨 [oscar-watch] /health 900s 内未就绪（见 $SERVE_LOG）"
+        echo "🚨 [oscar-watch] 900s 内未观察到服务就绪（见 $SERVE_LOG）"
     fi
 ) &
 WATCH_PID=$!
