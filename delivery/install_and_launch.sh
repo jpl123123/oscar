@@ -125,6 +125,10 @@ fi
 pkill -f "$MODEL_PATH" 2>/dev/null || true
 sleep 3 || true
 
+# ---------- 阶段3.9 启动前预检（env/插件/入口点；不通过即 fail） ----------
+step "启动前预检（delivery/check_oscar_active.sh --preflight）"
+bash delivery/check_oscar_active.sh --preflight || fail "预检未通过（见上方 ❌ 项）"
+
 # ---------- 阶段4 生成 pt（OSCAR 旋转检查点；校准默认 TP4 与 serve 一致） ----------
 ROT_DEFAULT="$REPO_ROOT/oscar_rotations.pt"
 if [ -z "${OSCAR_ASCEND_K_ROTATION_PATH:-}" ] && [ -z "${OSCAR_ASCEND_V_ROTATION_PATH:-}" ]; then
@@ -163,7 +167,50 @@ else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
 fi
 
-# ---------- 阶段6 serve ----------
-step "启动 vllm serve（目标命令 + 插件环境；日志: $SERVE_LOG）"
+# ---------- 阶段6 serve（后台 + 自动激活判定；不自动发请求） ----------
+step "后台启动 vllm serve（目标命令 + 插件环境；日志: $SERVE_LOG）"
 export OSCAR_ASCEND_LOG_DIR="$LOG_DIR"
-bash delivery/serve_oscar.sh "$@" 2>&1 | tee "$SERVE_LOG"
+SRV_PIDFILE="$LOG_DIR/serve.pid"
+if [ "${OSCAR_FOREGROUND_SERVE:-0}" == "1" ]; then
+    # 诊断逃生门：前台 + tee（阻塞）
+    bash delivery/serve_oscar.sh "$@" 2>&1 | tee "$SERVE_LOG"
+else
+    setsid nohup bash delivery/serve_oscar.sh "$@" > "$SERVE_LOG" 2>&1 &
+    echo $! > "$SRV_PIDFILE"
+    sleep 5
+    # 等待 /health 就绪（引擎装载+预热约 2-4 分钟；超时 900s）
+    READY=0
+    for i in $(seq 1 180); do
+        if python3 - <<'PYCHECK' 2>/dev/null
+import urllib.request
+try:
+    urllib.request.urlopen("http://127.0.0.1:8989/health", timeout=2)
+except Exception:
+    raise SystemExit(1)
+PYCHECK
+        then READY=1; break; fi
+        # 引擎崩溃则提前退出
+        if ! kill -0 "$(cat "$SRV_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            echo "  ⚠️ serve 进程已退出（启动失败）—— 日志尾部："
+            tail -n 30 "$SERVE_LOG"; fail "serve 启动失败"
+        fi
+        sleep 5
+    done
+    [ "$READY" -eq 1 ] || { tail -n 30 "$SERVE_LOG"; fail "/health 900s 内未就绪"; }
+    echo "  ✅ serve 就绪（http://0.0.0.0:8989/health）"
+    # 自动激活判定（核心三项：注入/类外科手术/配置；写读路径为待请求信息项）
+    bash delivery/check_oscar_active.sh "$SERVE_LOG"
+    if [ $? -eq 0 ]; then
+        echo "  ✅ OSCAR ACTIVE —— 服务保持运行（PID $(cat "$SRV_PIDFILE")，日志 $SERVE_LOG）"
+        echo "  ➜ 您现在可跑您的基准（ais_bench）；跑后再执行: bash delivery/check_oscar_active.sh $SERVE_LOG"
+    else
+        if [ "${OSCAR_KEEP_ON_FAIL:-0}" != "1" ]; then
+            echo "  🚨 NOT-ACTIVE → 自动停止服务（OSCAR_KEEP_ON_FAIL=1 可保留现场）"
+            kill -2 "$(cat "$SRV_PIDFILE")" 2>/dev/null || true
+            sleep 3
+            pkill -f "$MODEL_PATH" 2>/dev/null || true
+            fail "OSCAR 激活判定失败（见上方 ❌ 项）"
+        fi
+        echo "  ⚠️ NOT-ACTIVE 但 OSCAR_KEEP_ON_FAIL=1 —— 保留实例供现场诊断"
+    fi
+fi
