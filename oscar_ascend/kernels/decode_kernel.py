@@ -229,29 +229,41 @@ if triton is not None:
         Mid_o_ptr,      # [B, Hq, S, D+1]
         Out_ptr,        # [B, Hq, D]
         Lse_ptr,        # [B, Hq]
+        Seq_lens_ptr,   # [B] —— 空 split 结构守卫用（见循环内）
         stride_mid_b, stride_mid_h, stride_mid_s,
         stride_out_b, stride_out_h,
         stride_lse_b,
         NUM_KV_SPLITS: tl.constexpr, BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr,
     ):
+        # 语义对齐 vLLM _fwd_kernel_stage2（vllm/v1/attention/ops/triton_decode_attention.py
+        # :549-613）：① e_sum 跟踪 + 最终 term/e_sum 归一化（旧版丢失 → 输出整体差
+        # Σexp(lse−M)=L 倍，真机 07:39 probe err=4.39 即此）；② 空 split 结构守卫
+        # （seq_len < NUM_SPLITS×split_len 时 stage1 提前 return、mid 为 torch.empty
+        # 垃圾，不可读——多请求短序列场景必现）。
         bid = tl.program_id(0)
         hid = tl.program_id(1)
+        seq_len = tl.load(Seq_lens_ptr + bid)
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < HEAD_DIM
         base = bid * stride_mid_b + hid * stride_mid_h
         m = -float("inf")
+        e_sum = 0.0
         term = tl.zeros([BLOCK_D], dtype=tl.float32)
         for s in range(NUM_KV_SPLITS):
-            c = tl.load(Mid_o_ptr + base + s * stride_mid_s + HEAD_DIM)
-            finite = c > -float("inf")
-            c_safe = tl.where(finite, c, -1.0e30)
-            m_new = tl.maximum(m, c_safe)
-            o = tl.load(Mid_o_ptr + base + s * stride_mid_s + d_offs, mask=d_mask, other=0.0)
-            o = tl.where(finite, o, 0.0)
-            term = term * tl.exp(m - m_new) + o * tl.exp(c_safe - m_new)
-            m = m_new
-        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term, mask=d_mask)
-        tl.store(Lse_ptr + bid * stride_lse_b + hid, m)
+            split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+            split_start = split_len * s
+            split_end = tl.minimum(split_start + split_len, seq_len)
+            if split_end > split_start:
+                c = tl.load(Mid_o_ptr + base + s * stride_mid_s + HEAD_DIM)
+                m_new = tl.maximum(c, m)
+                old_scale = tl.exp(m - m_new)
+                exp_logic = tl.exp(c - m_new)
+                o = tl.load(Mid_o_ptr + base + s * stride_mid_s + d_offs, mask=d_mask, other=0.0)
+                term = term * old_scale + exp_logic * o
+                e_sum = e_sum * old_scale + exp_logic
+                m = m_new
+        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term / e_sum, mask=d_mask)
+        tl.store(Lse_ptr + bid * stride_lse_b + hid, m + tl.log(e_sum))
 
 
 if triton is not None:  # noqa: E305
@@ -294,7 +306,7 @@ if triton is not None:  # noqa: E305
         out = torch.empty(B, Hq, D, dtype=torch.float32, device=q_rot.device)
         lse = torch.empty(B, Hq, dtype=torch.float32, device=q_rot.device)
         _oscar_decode_stage2[(B, Hq)](
-            mid_o, out, lse,
+            mid_o, out, lse, seq_lens,
             mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
             out.stride(0), out.stride(1), lse.stride(0),
             NUM_KV_SPLITS=NUM_SPLITS, BLOCK_D=BLOCK_D, HEAD_DIM=D,

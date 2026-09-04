@@ -30,6 +30,10 @@
   真机 07:32 首跑：**store 内核字节级全对（triton-ascend 3.5.0 首次上机验证通过）**；
   dequant 判据 1e-3 低于 fp16 半 ulp 误报（err=1.953e-3 = 2^-9 恰为 amp∈[4,8) 半 ulp）
   → 判据改 2×fp16 ulp@amp（自打印界值），待用户复跑。
+  真机 07:39 二跑：dequant 过；**decode 内核 err=4.39 = 真移植 bug**（CPU numpy 逐 lane
+  镜像复现 max 4.11，out 恰差 L=Σexp(lse−M)≈2.05 倍）→ stage2 丢失 e_sum 归一化 +
+  无空 split 守卫（未初始化 mid_o 垃圾读）→ 已对齐 vLLM `_fwd_kernel_stage2`
+  （triton_decode_attention.py:549-613）修复，镜像复验 1.67e-06，待用户复跑。
 
 ## 本轮已定位并修复的精度链（6 项，详见 R-20260904 记录）
 （……同上……）
