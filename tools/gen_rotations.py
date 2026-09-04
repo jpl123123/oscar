@@ -110,7 +110,9 @@ def main() -> int:
 
     on_npu = _npu()
     dev = "npu" if on_npu else "cpu"
-    print(f"[gen-rotations] device={dev} seq_len={args.max_len}")
+    # CPU 压力控制：父进程只做一次性合并+eigh（NPU 不支持 eigh → CPU 回退），限 4 线程
+    torch.set_num_threads(min(4, max(1, torch.get_num_threads())))
+    print(f"[gen-rotations] device={dev} seq_len={args.max_len} cpu_threads={torch.get_num_threads()}")
 
     if not _force_ascend_platform():
         print("[gen-rotations] ❌ 平台未激活。请运行 python3 tools/diag_platform.py 并回传输出。")

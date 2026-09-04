@@ -32,6 +32,9 @@ MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
 # vllm_ascend:register 过滤掉 → 平台未激活（真机 diag [3] 石锤）。
 export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,oscar_ascend}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+# CPU 压力控制：限制 OpenMP/torch 线程数（默认 8；按需覆盖）
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+
 # vendor vllm 跨进程 RPC 传函数需 pickle 回退（官方提示的出口；gen 校准用）
 export VLLM_ALLOW_INSECURE_SERIALIZATION="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
 
