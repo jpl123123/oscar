@@ -24,7 +24,9 @@ PYTHON="${PYTHON:-python3}"
 LOG_DIR="${OSCAR_LOG_DIR:-/tmp/oscar_ascend_logs}"
 mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-SERVE_LOG="$LOG_DIR/serve_$STAMP.log"
+# serve 日志：固定名 + 每次启动原地覆盖（用户要求：不要时间戳命名、必须覆盖）
+SERVE_LOG="$LOG_DIR/serve.log"
+: > "$SERVE_LOG"   # 前置截断（setsid nohup > 亦会覆盖，双保险）
 
 MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
 # VLLM_PLUGINS 为跨组白名单（vllm envs.py:1041 逗号分隔、精确匹配）：必须同时包含

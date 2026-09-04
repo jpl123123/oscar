@@ -37,7 +37,8 @@ if [ "${1:-}" = "--preflight" ]; then
   exit $((1 - OK))
 fi
 
-LOG="${1:-$(ls -t /tmp/oscar_ascend_logs/serve_*.log 2>/dev/null | head -1)}"
+LOG="${1:-$(ls -t /tmp/oscar_ascend_logs/serve.log 2>/dev/null | head -1)}"
+[ -f "$LOG" ] || LOG="$(ls -t /tmp/oscar_ascend_logs/serve_*.log 2>/dev/null | head -1)"
 [ -n "${LOG}" ] && [ -f "${LOG}" ] || { echo "❌ 未找到 serve 日志（先跑 bash delivery/install_and_launch.sh）"; exit 2; }
 
 echo "==> 检查日志: $LOG"

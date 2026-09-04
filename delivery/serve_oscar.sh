@@ -64,4 +64,4 @@ exec vllm serve "$MODEL_PATH" \
     --mamba-ssm-cache-dtype bfloat16 \
     --enforce-eager \
     --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
-    $OSCAR_EXTRA_ARGS
+    ${OSCAR_EXTRA_ARGS:-}
