@@ -164,7 +164,9 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                     self._ensure_staging(layer, kv_cache)
                     self._staging_write(layer, key, value, attn_metadata)
                 except Exception as e:  # pragma: no cover — 窗口是精度增益，失败降级纯 INT2
-                    print(f"[oscar-ascend] 窗口 staging 跳过（降级纯 INT2）: {e}")
+                    if not getattr(layer, "_oscar_stage_skip_logged", False):
+                        layer._oscar_stage_skip_logged = True
+                        print(f"[oscar-ascend] 窗口 staging 跳过（降级纯 INT2，仅首次告警）: {e}")
 
         # 2) 读路径
         if state == getattr(AscendAttentionState, "DecodeOnly", None):
@@ -292,8 +294,14 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
     def _staging_write(self, layer, key, value, attn_metadata) -> None:
         N = attn_metadata.num_actual_tokens
         slot = attn_metadata.slot_mapping[:N].to(torch.int64)
-        seq = attn_metadata.seq_lens.to(torch.int64)
-        qsl = attn_metadata.query_start_loc.to(torch.int64)
+        # 设备硬化：元数据可能为 CPU（vendor 变体），一律统一到 slot 设备（NPU）
+        dev = slot.device
+        seat = getattr(attn_metadata, "seq_lens", None)
+        qstart = getattr(attn_metadata, "query_start_loc", None)
+        if seat is None or qstart is None:
+            raise RuntimeError("staging 元数据缺失（seq_lens/query_start_loc）")
+        seq = seat.to(dev).to(torch.int64)
+        qsl = qstart.to(dev).to(torch.int64)
         q_lens = qsl[1:] - qsl[:-1]
         req = torch.repeat_interleave(torch.arange(seq.shape[0], device=slot.device), q_lens)
         pos = seq[req] - qsl[req + 1] + torch.arange(N, device=slot.device)

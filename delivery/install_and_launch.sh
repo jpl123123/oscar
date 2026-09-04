@@ -169,20 +169,14 @@ else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
 fi
 
-# ---------- 阶段6 serve（后台 + 自动激活判定；不自动发请求） ----------
-step "后台启动 vllm serve（目标命令 + 插件环境；日志: $SERVE_LOG）"
+# ---------- 阶段6 serve（前台实时输出 + tee 落盘；后台观察者自动判定；不代发请求） ----------
+step "启动 vllm serve（前台实时显示；日志固定 /tmp/oscar_ascend_logs/serve.log 覆盖写入）"
 export OSCAR_ASCEND_LOG_DIR="$LOG_DIR"
-SRV_PIDFILE="$LOG_DIR/serve.pid"
-if [ "${OSCAR_FOREGROUND_SERVE:-0}" == "1" ]; then
-    # 诊断逃生门：前台 + tee（阻塞）
-    bash delivery/serve_oscar.sh "$@" 2>&1 | tee "$SERVE_LOG"
-else
-    setsid nohup bash delivery/serve_oscar.sh "$@" > "$SERVE_LOG" 2>&1 &
-    echo $! > "$SRV_PIDFILE"
-    sleep 5
-    # 等待 /health 就绪（引擎装载+预热约 2-4 分钟；超时 900s）
+# 后台观察者：等 /health → 自动跑激活判定（打印到同一终端，不打断 serve 前台）
+(
     READY=0
     for i in $(seq 1 180); do
+        sleep 5
         if python3 - <<'PYCHECK' 2>/dev/null
 import urllib.request
 try:
@@ -191,28 +185,20 @@ except Exception:
     raise SystemExit(1)
 PYCHECK
         then READY=1; break; fi
-        # 引擎崩溃则提前退出
-        if ! kill -0 "$(cat "$SRV_PIDFILE" 2>/dev/null)" 2>/dev/null; then
-            echo "  ⚠️ serve 进程已退出（启动失败）—— 日志尾部："
-            tail -n 30 "$SERVE_LOG"; fail "serve 启动失败"
+        # serve 提前退出（端口进程消失且日志显示启动失败）→ 直接报
+        if grep -q "EngineCore failed to start\|WorkerProc failed to start\|NPUModelRunner failed" "$SERVE_LOG" 2>/dev/null; then
+            echo "🚨 [oscar-watch] serve 启动失败（见上方/日志 $SERVE_LOG）"; exit 1
         fi
-        sleep 5
     done
-    [ "$READY" -eq 1 ] || { tail -n 30 "$SERVE_LOG"; fail "/health 900s 内未就绪"; }
-    echo "  ✅ serve 就绪（http://0.0.0.0:8989/health）"
-    # 自动激活判定（核心三项：注入/类外科手术/配置；写读路径为待请求信息项）
-    bash delivery/check_oscar_active.sh "$SERVE_LOG"
-    if [ $? -eq 0 ]; then
-        echo "  ✅ OSCAR ACTIVE —— 服务保持运行（PID $(cat "$SRV_PIDFILE")，日志 $SERVE_LOG）"
-        echo "  ➜ 您现在可跑您的基准（ais_bench）；跑后再执行: bash delivery/check_oscar_active.sh $SERVE_LOG"
+    if [ "$READY" -eq 1 ]; then
+        echo ""
+        echo "✅ [oscar-watch] serve 就绪（http://0.0.0.0:8989/health）—— 自动激活判定："
+        bash delivery/check_oscar_active.sh "$SERVE_LOG"
     else
-        if [ "${OSCAR_KEEP_ON_FAIL:-0}" != "1" ]; then
-            echo "  🚨 NOT-ACTIVE → 自动停止服务（OSCAR_KEEP_ON_FAIL=1 可保留现场）"
-            kill -2 "$(cat "$SRV_PIDFILE")" 2>/dev/null || true
-            sleep 3
-            pkill -f "$MODEL_PATH" 2>/dev/null || true
-            fail "OSCAR 激活判定失败（见上方 ❌ 项）"
-        fi
-        echo "  ⚠️ NOT-ACTIVE 但 OSCAR_KEEP_ON_FAIL=1 —— 保留实例供现场诊断"
+        echo "🚨 [oscar-watch] /health 900s 内未就绪（见 $SERVE_LOG）"
     fi
-fi
+) &
+WATCH_PID=$!
+# 前台 serve：实时输出 + tee 记录（同一行既给终端也进 serve.log）
+bash delivery/serve_oscar.sh "$@" 2>&1 | tee "$SERVE_LOG"
+kill "$WATCH_PID" 2>/dev/null || true
