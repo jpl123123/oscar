@@ -32,6 +32,8 @@ MODEL_PATH="${MODEL_PATH:-/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp}"
 # vllm_ascend:register 过滤掉 → 平台未激活（真机 diag [3] 石锤）。
 export VLLM_PLUGINS="${VLLM_PLUGINS:-ascend,oscar_ascend}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+# vendor vllm 跨进程 RPC 传函数需 pickle 回退（官方提示的出口；gen 校准用）
+export VLLM_ALLOW_INSECURE_SERIALIZATION="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
 
 # 显式选择 0-3 号卡：npu-smi 显示 4-7 卡被其它作业占满（各 ~26GB），TP4 必须落到空闲卡
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"

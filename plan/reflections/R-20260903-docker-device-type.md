@@ -160,3 +160,17 @@ reflect gate（本记录）→ 待跑
   （模块级可 pickle），worker 内对已加载模型做一次纯文本前向，Attention 前向钩子捕获
   未量化 K/V → 逐层协方差（TP 分片累计）→ 父进程跨 rank 加权合并 → eigh → 保存。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §12 后续进展（2026-09-04 00:18 真机日志六）—— RPC 序列化出口
+
+- 平台/装载已稳定复现通过；新失败：`TypeError: Object of type <class 'function'> is not
+  serializable. Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow fallback to pickle-based
+  serialization.`（vendor vllm `serial_utils.enc_hook`，collective_rpc 传函数默认拒绝）。
+- 修复：按 vendor 官方提示出口，**任何 vllm import 前** `VLLM_ALLOW_INSECURE_SERIALIZATION=1`
+  （gen_rotations 顶部 setdefault + install 脚本默认导出，serve 继承）；
+  `calib.capture_cov` 为模块级函数（pickle 安全）。
+- 一次性复查（本提交前完成）：跨 rank 协方差合并数学（两分片==全量，atol=1e-5）、
+  R 正交性（RᵀR=RRᵀ=I，atol=1e-4）、特征值降序，全部本地数值验证 PASS；
+  tests 8/8；后续链路（probe ref/triton → serve 注入）静态核对无已知缺口。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。

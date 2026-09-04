@@ -29,6 +29,9 @@ import torch
 # set_num_threads 触发 "ParallelOpenMP.cpp:64 Invalid thread pool" 硬崩溃。
 # 必须在任何 vllm 导入前设置（vllm.envs 于 import 时读取该值）。
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+# vendor vllm serial_utils 默认不允许跨进程传函数（collective_rpc 需要）：
+# 错误提示官方出口 = VLLM_ALLOW_INSECURE_SERIALIZATION=1（回退 pickle；模块级函数可 pickle）
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
 def _npu() -> bool:
