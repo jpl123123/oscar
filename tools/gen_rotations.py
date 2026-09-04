@@ -116,11 +116,13 @@ def main() -> int:
         print("[gen-rotations] ❌ 平台未激活。请运行 python3 tools/diag_platform.py 并回传输出。")
         return 3
 
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
 
     from oscar_ascend import calib
 
-    calib._CALIB_SEQ_LEN = args.max_len  # capture_cov 使用的采样序列长度
+    # 校准模式：插件在 worker 里挂 K/V 捕获钩子（不替换 impl，不做裸 model 前向）
+    os.environ["OSCAR_ASCEND_CALIB"] = "1"
+    os.environ.pop("OSCAR_ASCEND_ENABLE", None)  # 钩子由 CALIB 分支处理，无需注入开关
     llm_args = json.loads(os.environ.get("OSCAR_ASCEND_GEN_LLM_ARGS", "{}"))
     # 默认 TP4 + 0.9 显存（target serve 同款）：27B W8A8 权重 > 单卡 29.49GiB（实测必 OOM）
     llm_args.setdefault("tensor_parallel_size", 4)
@@ -132,11 +134,20 @@ def main() -> int:
         dtype="bfloat16",
         **llm_args,
     )
-    print("[gen-rotations] 引擎就绪，worker 内执行校准前向（apply_model）…")
+    print("[gen-rotations] 引擎就绪；清空捕获缓冲 + 跑校准前向（引擎正常路径）…")
 
-    per_rank = llm.llm_engine.apply_model(calib.capture_cov)
+    llm.llm_engine.apply_model(calib.reset_captures)
+    # 一条长校准文本：prefill 即产生 ~256 tokens 的 K/V（每个 worker 每层 cap=512）
+    prompt = (
+        "OSCAR 旋转校准用例：量子计算与自然语言处理都是非结构化数据上的双重挑战。"
+        "模型应当对长程序列保持稳定的隐藏表示，并在注意力方向上分配较低的量化噪声。" * 4
+    )[: max(64, args.max_len - 8)]
+    llm.generate(prompt, SamplingParams(max_tokens=4, temperature=0.0))
+    print("[gen-rotations] 校准前向完成；worker 内统计协方差…")
+
+    per_rank = llm.llm_engine.apply_model(calib.finalize_cov)
     if not per_rank or not per_rank[0]:
-        print("[gen-rotations] ❌ 未捕获到任何 K/V（检查模型结构/apply_model 支持）")
+        print("[gen-rotations] ❌ 未捕获到任何 K/V（检查 OSCAR_ASCEND_CALIB 钩子/模型结构）")
         return 4
 
     D = args.head_dim

@@ -67,7 +67,8 @@ def load_plugin() -> None:
     if _PATCHED:
         return
     _bootstrap_platform()
-    if os.environ.get("OSCAR_ASCEND_ENABLE", "auto") == "0":
+    if os.environ.get("OSCAR_ASCEND_ENABLE", "auto") == "0" and \
+            os.environ.get("OSCAR_ASCEND_CALIB", "0") != "1":
         print("[oscar-ascend] OSCAR_ASCEND_ENABLE=0 → 不注入（校准/诊断用原生路径）")
         _PATCHED = True
         return
@@ -86,6 +87,15 @@ def load_plugin() -> None:
 
         def _patched_init(self, *args, **kwargs):
             orig_init(self, *args, **kwargs)
+            if os.environ.get("OSCAR_ASCEND_CALIB", "0") == "1":
+                # 校准模式：不替换 impl，只挂 K/V 捕获钩子（走引擎正常运行路径）
+                try:
+                    from .calib import register_attention_hook
+
+                    register_attention_hook(self)
+                except Exception as e:  # pragma: no cover
+                    print(f"[oscar-ascend] 校准钩子注册失败: {e}")
+                return None
             try:
                 impl = getattr(self, "impl", None)
                 if impl is None or not _should_oscar(self, impl):

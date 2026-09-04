@@ -174,3 +174,21 @@ reflect gate（本记录）→ 待跑
   R 正交性（RᵀR=RRᵀ=I，atol=1e-4）、特征值降序，全部本地数值验证 PASS；
   tests 8/8；后续链路（probe ref/triton → serve 注入）静态核对无已知缺口。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §13 后续进展（2026-09-04 00:31 真机日志七）—— forward context + 采样改走引擎路径
+
+- RPC 序列化修复生效（`Allowing insecure serialization using pickle`），新失败：
+  worker 内 `model(input_ids=..., positions=...)` 裸前向 →
+  `AssertionError: Forward context is not set. Please use set_forward_context...`
+  （vllm-ascend patch_qwen3_5.py:104 `_EXTRA_CTX` 读取 forward context，仅引擎
+  execute_model 内存在）。
+- 修复（采样改走引擎正常路径，不做裸前向）：
+  * `oscar_ascend/calib.py` 重写：worker 侧捕获注册表 + `register_attention_hook`
+    （插件 OSCAR_ASCEND_CALIB=1 时挂 Attention 前向钩子，每层 cap 512 tokens）；
+    `reset_captures` / `finalize_cov` 为模块级（pickle 安全），后者**零 model 前向**。
+  * `plugin.py`：CALIB=1 时即使 ENABLE=0 也安装包装器，仅挂钩子、不做类外科手术。
+  * `gen_rotations.py`：先 `apply_model(reset)` → `llm.generate(一条长校准文本,
+    max_tokens=4)`（引擎正常运行，forward context 就绪）→ `apply_model(finalize_cov)`
+    → 跨 rank 合并 → eigh → 保存。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
