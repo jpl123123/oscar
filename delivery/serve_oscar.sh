@@ -38,6 +38,13 @@ if [ ! -f "$OSCAR_ASCEND_K_ROTATION_PATH" ]; then
   echo "   可用 OSCAR_ASCEND_GEN_ROTATIONS=1 bash delivery/install_and_launch.sh 重新生成）"
 fi
 
+# R6 硬性：OSCAR impl 含运行时宿主控制流（.item()/.tolist()/逐层首写日志），
+# 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 默认 --enforce-eager 防图捕获破坏。
+# 想恢复 graph：OSCAR_EAGER=0（不推荐，未验证）。
+ENFORCE_EAGER="${OSCAR_EAGER:-1}"
+EAGER_ARGS=()
+[ "$ENFORCE_EAGER" == "1" ] && EAGER_ARGS=(--enforce-eager)
+
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "qwen3.5" \
     --host 0.0.0.0 \

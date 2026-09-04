@@ -142,22 +142,51 @@ def load_plugin() -> None:
         _PATCHED = True
 
 
+def _is_hybrid_config(model_config) -> bool:
+    """hybrid 判定（可测试的纯函数）。
+
+    ① 引擎 ModelConfig.is_hybrid（registry ModelInfo 标注）；
+    ② 兜底：Qwen3.5 等架构在 registry 未标 is_hybrid，但 hf_config.layer_types
+       含非 attention 层（linear_attention/mamba）→ 仍是混合模型
+       （真机 2026-09-04：serve 时 is_hybrid=False 但层内含 GDN → 无手术的根因）。
+    """
+    if getattr(model_config, "is_hybrid", False):
+        return True
+    hf = getattr(model_config, "hf_text_config", None) or getattr(model_config, "hf_config", None)
+    layer_types = getattr(hf, "layer_types", None) or []
+    return any(lt != "attention" for lt in layer_types)
+
+
+_SKIP_REASONS_LOGGED: set = set()
+
+
 def _should_oscar(layer, impl) -> bool:
-    """hybrid 模型的 decoder full-attention 层（plan §5.5）。"""
+    """hybrid 模型的 decoder full-attention 层（plan §5.5）；失败打印拒绝原因（首个即可）。"""
     try:
         from vllm.config import get_current_vllm_config
 
         cfg = get_current_vllm_config()
-        if not getattr(cfg.model_config, "is_hybrid", False):
-            return False
+        mc = cfg.model_config
+        reasons = []
+        if not _is_hybrid_config(mc):
+            reasons.append("not-hybrid")
         if str(getattr(impl, "attn_type", "decoder")) != "decoder":
-            return False
+            reasons.append(f"attn_type={getattr(impl, 'attn_type', None)!r}")
         if getattr(impl, "sliding_window", None) is not None:
-            return False
+            reasons.append("sliding-window")
         if getattr(impl, "sinks", None) is not None:
+            reasons.append("sinks")
+        if reasons:
+            key = ",".join(reasons)
+            if key not in _SKIP_REASONS_LOGGED:
+                _SKIP_REASONS_LOGGED.add(key)
+                print(f"[oscar-ascend][SKIP] {getattr(layer, 'layer_name', '?')} → 不替换: {key}"
+                      f"（is_hybrid={getattr(mc, 'is_hybrid', '?')}，"
+                      f"layer_types={'含非attention层' if _is_hybrid_config(mc) else '无/全attention'}）")
             return False
         return True
-    except Exception:
+    except Exception as e:  # pragma: no cover
+        print(f"[oscar-ascend][SKIP] _should_oscar 异常: {e}")
         return False
 
 

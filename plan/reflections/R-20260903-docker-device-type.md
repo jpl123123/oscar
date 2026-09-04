@@ -291,3 +291,21 @@ reflect gate（本记录）→ 待跑
 - 沙盒建模覆盖策略（本轮起）：triton store 语义由本地镜像测试等价实现
   （vector_scales + floor(x+0.5) + 打包 = format.make_slot_bytes 字节=0），
   npu 端 cast/位运算差异由“精确值转换恒等”设计兜底 + probe 真机对照。
+
+
+## §22 深度排查（2026-09-04 02:08-02:11 完整 serve 日志）—— 插件加载但未手术
+
+- 证据：`plugin 注入 OK` 在 APIServer/EngineCore/4×Worker 全部出现；但
+  `★ 类外科手术/配置/写路径` **全部缺失** → `_should_oscar` 对每个 Attention 静默 False。
+- 根因（自查代码缺口）：`_should_oscar` 只看 `model_config.is_hybrid`；
+  registry（registry.py:775 ModelInfo.is_hybrid）对 Qwen3_5ForConditionalGeneration
+  **未标注 hybrid** → is_hybrid=False → 一律跳过；而校准（OSCAR_ASCEND_CALIB）分支在
+  _should_oscar **之前** return，因此校准侥幸成功、serve 从未生效——自证日志正是为此而加。
+- 修复：
+  * `_is_hybrid_config` 兜底：hf_text_config.layer_types 含非 attention 层（linear_attention/
+    mamba）→ 视为 hybrid（可测试纯函数；tests 10/10）；
+  * `_should_oscar` 失败打印 `[oscar-ascend][SKIP] <layer>: 原因`（首个每次因一次）；
+  * serve 默认 `--enforce-eager`（OSCAR_EAGER=1；R6：OSCAR impl 含宿主控制流
+    .item()/.tolist()，仅 eager 验证；PR `_cudagraph_support=NEVER` 同理）。
+- 潜在后续关注：MTP drafter 层（full_attention）手术覆盖与 KV 写入语义；
+  graph 模式与 OSCAR 兼容性（当前默认 eager 规避）。

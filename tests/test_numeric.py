@@ -214,6 +214,36 @@ def t_triton_store_model_bf16():
     assert d == 0, f"triton store 路径建模字节差 = {d}"
 
 
+
+def t_hybrid_detection():
+    """_is_hybrid_config 纯函数（registry 未标 is_hybrid 的 Qwen3.5 兜底）。"""
+    from oscar_ascend.plugin import _is_hybrid_config
+
+    class HF:
+        layer_types = ["linear_attention", "linear_attention", "attention"]
+
+    class MC:
+        is_hybrid = False
+        hf_text_config = HF()
+
+    assert _is_hybrid_config(MC()) is True, "layer_types 含非 attention → hybrid 应为 True"
+
+    class HF2:
+        layer_types = ["attention" * 1]
+
+    class MC2:
+        is_hybrid = False
+        hf_text_config = HF2()
+
+    assert _is_hybrid_config(MC2()) is False, "全 attention → False"
+
+    class MC3:
+        is_hybrid = True
+        hf_text_config = None
+
+    assert _is_hybrid_config(MC3()) is True, "is_hybrid=True 直接通过"
+
+
 def t_plugin_purity():
     """回归守卫：插件入口文件顶层禁止 vllm_ascend 导入（真机 Docker 循环导入教训）。"""
     import pathlib
@@ -234,6 +264,7 @@ def main():
     check("prefill continuation 形状/运行", t_prefill_ref)
     check("rotation 检查点加载/缺层回退", t_rotation_loader)
     check("triton store 路径建模(bf16) 字节差=0", t_triton_store_model_bf16)
+    check("hybrid 判定纯函数(含兜底)", t_hybrid_detection)
     check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0
