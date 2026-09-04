@@ -10,6 +10,7 @@
 |---|---|---|---|
 | `PLAN-1-oscar-int2-vllm-ascend.md` | OSCAR INT2 KV 量化在 vllm-ascend 0.23.0 混合模型（Qwen3.5-27B-w8a8-mtp）上的零侵入插件方案 | DRAFT | 依据 references/oscar-vllm-pr46774 (57286d5d) + references/vllm (0fc695fc) + references/vllm-ascend (19e436985) |
 | `ANALYSIS-20260904-C-kv-chain-and-oscar-q1q2.md` | 纯分析：vLLM-Ascend KV 调度全链路（六阶段流程图）+ Q1 布局/混合精度判决 + Q2 读写正确性审计 + warmup 110s 归因（不改代码） | ANALYSIS | 工作区 HEAD `1e95146` + 参考树行号逐条人工复核；取证清单 §7 |
+| `ANALYSIS-20260904-D-kv-storage-modes-and-rolemodel.md` | 纯分析：KV 存放/读取三模式对比（插件版 vs OSCAR PR vs upstream TurboQuant）+ role model 判决（TQ 蓝图 + PR 数值配方） | ANALYSIS | 三树行号实测 + vllm-ascend 无 TQ / varjoranta 归属取证（2026-09-04） |
 
 ## 边界（plan/ vs docs/）
 
