@@ -139,20 +139,27 @@ def main() -> int:
             return 1
 
         # ---- triton dequant 内核对照（serve 热路径：_prefill_attention 每步执行；
-        #      backend 无 try/except 回退 → probe 必须cover，否则翻 USE_TRITON 即裸奔）。
-        #      内核落盘 fp16（rotated space），ref 为 fp32 → 判据 ≤1e-3（fp16 舍入量级）。
+        #      backend 无 try/except 回退 → probe 必须 cover，否则翻 USE_TRITON 即裸奔）。
+        #      契约：内核按 PR 同款落盘 **fp16**（rotated space），ref 为 fp32 理想值
+        #      → 判据 = ≤2 个 fp16 ulp @数据最大幅值（舍入/FMA 路径差的理论界）。
+        #      真机 07:32 教训：固定 1e-3 低于 fp16 半 ulp 会误报——实测 err=1.953e-3
+        #      恰为 2^-9 = 幅值∈[4,8) 的半 ulp（夹具 randn*1.5 重建值达 ~4.7）。
+        import math as _math
+
         from oscar_ascend.kernels.dequant_kernel import oscar_full_dequant_triton
 
         bt_row = torch.zeros(1, dtype=torch.int64, device=dev)
         kt, vt = oscar_full_dequant_triton(k_cache, v_cache, bt_row, N, Hk, D)
+        amp = max(k_rec.abs().max().item(), v_rec.abs().max().item(), 1.0)
+        ulp = torch.finfo(torch.float16).eps * (2.0 ** _math.floor(_math.log2(amp)))
         ed = max(
             (kt.float() - k_rec).abs().max().item(),
             (vt.float() - v_rec).abs().max().item(),
         )
-        if ed > 1e-3:
-            print(f"❌ [triton] dequant 内核 err = {ed:.3e}（判据 ≤1e-3）")
+        if ed > 2 * ulp:
+            print(f"❌ [triton] dequant 内核 err = {ed:.3e}（判据 ≤{2 * ulp:.3e} = 2×fp16 ulp @amp={amp:.2f}）")
             return 1
-        print(f"✅ [triton] dequant 内核 err = {ed:.3e}（≤1e-3；fp16 落盘判据）")
+        print(f"✅ [triton] dequant 内核 err = {ed:.3e}（≤{2 * ulp:.3e} = 2×fp16 ulp @amp={amp:.2f}）")
 
         # ---- triton decode 内核对照（本部署 MTP 下不路由，但保持与 ref 同判据门禁）。
         from oscar_ascend.kernels.decode_kernel import oscar_decode_triton

@@ -27,6 +27,9 @@
   特化（Hk=1/Hq=8）；逃生门 `REQUIRE_TRITON=0` 失败自动降级 `USE_TRITON=0`；
   `check_oscar_active.sh` 新增 [7] `triton=启用` 复核项。动机：ANALYSIS-C §5.7-S7
   （此前 triton 默认关 + probe 只观察 → serve 全 torch 参考路径）。
+  真机 07:32 首跑：**store 内核字节级全对（triton-ascend 3.5.0 首次上机验证通过）**；
+  dequant 判据 1e-3 低于 fp16 半 ulp 误报（err=1.953e-3 = 2^-9 恰为 amp∈[4,8) 半 ulp）
+  → 判据改 2×fp16 ulp@amp（自打印界值），待用户复跑。
 
 ## 本轮已定位并修复的精度链（6 项，详见 R-20260904 记录）
 （……同上……）
