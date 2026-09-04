@@ -19,8 +19,11 @@ import sys
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--head-dim", type=int, default=256)
-    ap.add_argument("--num-kv-heads", type=int, default=8)
-    ap.add_argument("--num-heads", type=int, default=16)
+    # 头数默认对齐真实 serve 每 rank 形态（Qwen3.5-27B TP4：Hk=1、Hq=8）——
+    # triton 内核以 NUM_KV_HEADS/KV_GROUP_SIZE 为 constexpr，probe 必须编译与
+    # serve 完全相同的特化，PASS 才对 serve 有门禁意义。
+    ap.add_argument("--num-kv-heads", type=int, default=1)
+    ap.add_argument("--num-heads", type=int, default=8)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--mode", choices=["ref", "triton"], default="ref")
     ap.add_argument("--num-tokens", type=int, default=3)
@@ -131,9 +134,35 @@ def main() -> int:
                 if len(diffs) >= 12:
                     break
             print("  diff(槽idx, 槽内偏移B, triton, ref):", diffs)
-        print(f"✅ triton vs ref 字节一致: {equal}")
+        print(f"{'✅' if equal else '❌'} triton vs ref 字节一致: {equal}")
         if not equal:
             return 1
+
+        # ---- triton dequant 内核对照（serve 热路径：_prefill_attention 每步执行；
+        #      backend 无 try/except 回退 → probe 必须cover，否则翻 USE_TRITON 即裸奔）。
+        #      内核落盘 fp16（rotated space），ref 为 fp32 → 判据 ≤1e-3（fp16 舍入量级）。
+        from oscar_ascend.kernels.dequant_kernel import oscar_full_dequant_triton
+
+        bt_row = torch.zeros(1, dtype=torch.int64, device=dev)
+        kt, vt = oscar_full_dequant_triton(k_cache, v_cache, bt_row, N, Hk, D)
+        ed = max(
+            (kt.float() - k_rec).abs().max().item(),
+            (vt.float() - v_rec).abs().max().item(),
+        )
+        if ed > 1e-3:
+            print(f"❌ [triton] dequant 内核 err = {ed:.3e}（判据 ≤1e-3）")
+            return 1
+        print(f"✅ [triton] dequant 内核 err = {ed:.3e}（≤1e-3；fp16 落盘判据）")
+
+        # ---- triton decode 内核对照（本部署 MTP 下不路由，但保持与 ref 同判据门禁）。
+        from oscar_ascend.kernels.decode_kernel import oscar_decode_triton
+
+        out_t, _ = oscar_decode_triton(q, k_cache, v_cache, bt, seq, 0.125, Hk, D)
+        et = (out_t - out_ref).abs().max().item()
+        if et > 1e-4:
+            print(f"❌ [triton] decode 内核 err = {et:.3e}（判据 ≤1e-4）")
+            return 1
+        print(f"✅ [triton] decode 内核 err = {et:.3e}（≤1e-4）")
 
     print(f"🎉 probe 全 PASS（mode={args.mode}）—— 允许 serve")
     return 0

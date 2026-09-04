@@ -87,15 +87,19 @@ python3 tests/test_numeric.py    # CPU 镜像：store 字节差=0 / dequant≤1e
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | `oscar_rotations.pt` | 旋转检查点（**v2 配方 = U·H·P_br 组合 + qqt/sst 目标**；K/V 用 `rotation`/`rotation_v` 字段；缺省→单位阵；install_and_launch 检测到 v1 旧配方会自动重校准） |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | `0.96` / `0.92` | 分位裁剪（**sort-based**，对齐论文内核；0=关闭——per-vector INT2 无裁剪 ≈ 噪声，勿关） |
 | `OSCAR_ASCEND_SINK_TOKENS` / `RECENT_TOKENS` / `STAGING_TOKENS` | `128` / `256` / `8192` | BF16 Sink/Recent 窗口与 staging 容量（sink 必须 ≥ block_size=128 才产生实际页；64 会静默失效） |
-| `OSCAR_ASCEND_FORCE_TORCH` | `0` | `1`=强制 torch 参考路径（跳过 Triton，调试用） |
+| `OSCAR_ASCEND_USE_TRITON` | `1`（serve 脚本默认） | `0`=torch 参考路径（降级/调试）。一键 probe PASS 后 serve 即走 Triton 内核（store 散写单核 / dequant fused） |
+| `OSCAR_ASCEND_REQUIRE_TRITON` | `1`（一键脚本默认） | 阶段5 triton probe **硬门禁**（store 字节 + dequant/decode 数值对照，同 serve 的 Hk=1/Hq=8 特化）；`0`=观察模式：probe 失败自动降级 `USE_TRITON=0` 并告警，绝不带未验证内核进 serve |
 | `VLLM_ALLOW_INSECURE_SERIALIZATION` | `1`（脚本默认） | vendor vllm 跨进程 RPC 传函数需 pickle 回退（`collective_rpc`/`apply_model`；官方错误提示的指定出口） |
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn`（脚本默认） | 多进程 worker 启动方式；该 Docker 多线程父进程下 `fork` 会触发 PyTorch `ParallelOpenMP Invalid thread pool` 崩溃（12:58 实测） |
 
 ## 诚实边界（务必阅读）
 
 - **数值**：本地 CPU 镜像 16/16 PASS（store 字节差=0、dequant≤1e-5、decode≤1e-4、旋转不变性、旋转加载/缺层回退 + **精度地板**（旋转组合 U@H@P vs 纯 U：旧 1.568 / 新 0.377）、裁剪语义、MTP 草稿层拒绝、Σ_Q/Σ_S 校准统计）。
-  Triton 内核尚未在任何 NPU 编译运行——真机 probe 的 `--mode triton` 会**逐字节对比**
-  Triton 与参考实现（`ref`），FAIL 即拒绝 serve（R3）。
+  Triton 内核已纳入一键硬门禁：`--mode triton` 会**逐字节对比** store、并对
+  dequant/decode 内核做数值对照（≤1e-3/≤1e-4，同 serve 的 Hk=1/Hq=8 编译特化），
+  FAIL 即拒绝 serve；PASS 后 serve 默认 `OSCAR_ASCEND_USE_TRITON=1`（`check_oscar_active.sh`
+  第 [7] 项可复核 `triton=启用`）。decode 内核在 MTP（attn_state 恒 SpecDecoding）下
+  不被路由——见 `plan/ANALYSIS-20260904-C-...md` §5.3。
 - **页常数**：你提供的 P=801,792 等为 HYPOTHESIS（参考树未含）；服务启动日志与 probe
   会打印 `kv_cache_tensor.size` / `k_cache.stride` / `page_size_padded`，与偏移公式对账
   （plan R1）。

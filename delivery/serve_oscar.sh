@@ -35,6 +35,13 @@ export OSCAR_ASCEND_V_CLIP_RATIO="${OSCAR_ASCEND_V_CLIP_RATIO:-0.92}"
 export OSCAR_ASCEND_SINK_TOKENS="${OSCAR_ASCEND_SINK_TOKENS:-128}"
 export OSCAR_ASCEND_RECENT_TOKENS="${OSCAR_ASCEND_RECENT_TOKENS:-256}"
 export OSCAR_ASCEND_STAGING_TOKENS="${OSCAR_ASCEND_STAGING_TOKENS:-8192}"
+# Triton 路径默认启用（store 单核散写 / dequant fused 反量化；2026-09-04 起一键默认）。
+# 门禁契约：install_and_launch.sh 阶段5 的 triton probe 默认硬门禁（REQUIRE_TRITON=1），
+# probe 覆盖 store 字节 + dequant/decode 数值对照（与 serve 相同的 Hk=1/Hq=8 特化）；
+# 观察模式（REQUIRE_TRITON=0）下 probe 失败时启动器会显式注入 USE_TRITON=0 覆盖此默认。
+# ⚠️ 直接运行本脚本不经过 probe 门禁：若 triton-ascend 编译异常，用
+#    OSCAR_ASCEND_USE_TRITON=0 bash delivery/serve_oscar.sh 回退 torch 参考路径。
+export OSCAR_ASCEND_USE_TRITON="${OSCAR_ASCEND_USE_TRITON:-1}"
 
 if [ ! -f "$OSCAR_ASCEND_K_ROTATION_PATH" ]; then
   echo "⚠️ [oscar-ascend] 旋转检查点不存在: $OSCAR_ASCEND_K_ROTATION_PATH（将以单位阵降级运行；"

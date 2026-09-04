@@ -21,6 +21,12 @@
 - ⏳ **待用户复跑一键**：install_and_launch 检测到旧配方 pt（format_version<2）会自动
   **强制重校准**（U·H·P_br + qqt/sst），随后 serve 写/读路径应 **16 层 ×4 rank 且不含
   mtp 层**（MTP 草稿层保持 BF16）；用户 ais_bench 复核接受率。
+- 🔧 **同日二段（纯交付层，零核心代码）**：一键默认 Triton 路径——`serve_oscar.sh`
+  `OSCAR_ASCEND_USE_TRITON=1` 默认 + 阶段5 `REQUIRE_TRITON=1` 硬门禁；probe 补
+  dequant/decode 内核数值对照（backend 无回退分支，必须先 probe）且头数对齐 serve
+  特化（Hk=1/Hq=8）；逃生门 `REQUIRE_TRITON=0` 失败自动降级 `USE_TRITON=0`；
+  `check_oscar_active.sh` 新增 [7] `triton=启用` 复核项。动机：ANALYSIS-C §5.7-S7
+  （此前 triton 默认关 + probe 只观察 → serve 全 torch 参考路径）。
 
 ## 本轮已定位并修复的精度链（6 项，详见 R-20260904 记录）
 （……同上……）

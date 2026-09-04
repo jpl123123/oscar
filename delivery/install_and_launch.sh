@@ -11,7 +11,8 @@
 #   2) 安装     —— 入口点已存在则跳过；否则 pip install --no-deps --no-build-isolation -e .
 #   3) 指纹     —— HEAD / plugin sha256 / entry point / import
 #   4) 生成 pt  —— tools/gen_rotations.py（OSCAR 旋转检查点；已存在或 env 已给路径则跳过）
-#   5) 数值probe —— delivery/probe_oscar.py（ref + triton 双模式，阻塞 serve）
+#   5) 数值probe —— delivery/probe_oscar.py（ref + triton 双模式，阻塞 serve；
+#      triton probe 默认硬门禁 OSCAR_ASCEND_REQUIRE_TRITON=1，PASS 才以 USE_TRITON=1 起 serve）
 #   6) serve    —— delivery/serve_oscar.sh（用户目标启动命令 + 插件环境）
 #
 # 失败协议：任一阶段非零 → 打印阶段名/日志尾部/修复指引后退出（不静默继续）。
@@ -73,7 +74,7 @@ try:
     from vllm.triton_utils import HAS_TRITON
     print("  HAS_TRITON:", HAS_TRITON)
     if not HAS_TRITON:
-        print("  ⚠️ HAS_TRITON=False → probe 只验证 torch 参考路径；性能路径需 triton-ascend")
+        print("  ⚠️ HAS_TRITON=False → 阶段5 将拒绝 serve（REQUIRE_TRITON=1 默认硬门禁；逃生门 OSCAR_ASCEND_REQUIRE_TRITON=0）")
 except Exception as e:
     print("  HAS_TRITON: import failed:", e)
 eps = [e for e in md.entry_points(group="vllm.general_plugins") if e.name == "oscar_ascend"]
@@ -172,20 +173,32 @@ fi
 
 # ---------- 阶段5 数值 probe（阻塞 serve） ----------
 step "真机数值 probe（ref + triton；FAIL 阻断 serve）"
+# Triton 门禁契约（2026-09-04 起）：REQUIRE_TRITON 默认=1（硬门禁）——triton probe
+# 覆盖 store 字节一致 + dequant/decode 内核数值对照（与 serve 同 Hk=1/Hq=8 特化），
+# PASS 才允许 serve 以 OSCAR_ASCEND_USE_TRITON=1 启动；失败/无 triton 一律拒绝。
+# 逃生门：OSCAR_ASCEND_REQUIRE_TRITON=0（观察模式）——probe 失败时显式注入
+# USE_TRITON=0 降级 torch 参考路径（绝不带未验证内核进 serve）。
+REQUIRE_TRITON="${OSCAR_ASCEND_REQUIRE_TRITON:-1}"
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
     "$PYTHON" delivery/probe_oscar.py --mode ref \
         || fail "数值 probe(ref) FAIL —— 拒绝 serve"
     if $PYTHON -c "from vllm.triton_utils import HAS_TRITON; import sys; sys.exit(0 if HAS_TRITON else 1)"; then
-        # Triton-ascend 尚未上机验收（torch-npu 位运算已有缺陷先例）；默认观察不阻断，
-        # OSCAR_ASCEND_REQUIRE_TRITON=1 时才作为硬门禁
-        if [ "${OSCAR_ASCEND_REQUIRE_TRITON:-0}" == "1" ]; then
+        if [ "$REQUIRE_TRITON" == "1" ]; then
             "$PYTHON" delivery/probe_oscar.py --mode triton \
-                || fail "数值 probe(triton) FAIL（REQUIRE_TRITON=1）—— 拒绝 serve"
+                || fail "数值 probe(triton) FAIL —— 拒绝 serve（默认硬门禁；降级逃生门：OSCAR_ASCEND_REQUIRE_TRITON=0）"
+            echo "  ✅ triton probe PASS → serve 将以 OSCAR_ASCEND_USE_TRITON=1 启动（serve_oscar.sh 默认）"
+        elif "$PYTHON" delivery/probe_oscar.py --mode triton; then
+            echo "  ✅ triton probe PASS（观察模式）→ USE_TRITON 保持默认 1"
         else
-            "$PYTHON" delivery/probe_oscar.py --mode triton || echo "  ⚠️ triton probe 未通过（观察模式，服务走 torch 参考路径）"
+            echo "  ⚠️ triton probe 未通过（观察模式）→ 强制 OSCAR_ASCEND_USE_TRITON=0（torch 参考路径）"
+            export OSCAR_ASCEND_USE_TRITON=0
         fi
     else
-        echo "  HAS_TRITON=False → 跳过 triton probe（服务将走 torch 参考路径）"
+        if [ "$REQUIRE_TRITON" == "1" ]; then
+            fail "HAS_TRITON=False 且 REQUIRE_TRITON=1 —— 拒绝 serve（修复：容器需预装且恰一 active 的 triton-ascend driver；降级逃生门：OSCAR_ASCEND_REQUIRE_TRITON=0）"
+        fi
+        echo "  HAS_TRITON=False → 强制 OSCAR_ASCEND_USE_TRITON=0（torch 参考路径）"
+        export OSCAR_ASCEND_USE_TRITON=0
     fi
 else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
