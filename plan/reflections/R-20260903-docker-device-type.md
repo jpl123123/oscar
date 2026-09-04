@@ -214,3 +214,14 @@ reflect gate（本记录）→ 待跑
 - 修复：gen_rotations `llm_args.setdefault("mamba_cache_dtype", "bfloat16")` +
   `mamba_ssm_cache_dtype="bfloat16"`（LLM(**kwargs) 透传 EngineArgs，llm.py:65）。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §16 后续进展（2026-09-04 01:09 真机日志十）—— 链路全通，层号解析
+
+- **校准管线全链路已在真机跑通**：generate 完成（prefill 12.48 toks/s、5.05s）、
+  worker 侧钩子捕获成功（键形如 `language_model.model.layers.11.self_attn.attn`）、
+  协方差返回、`aten::_linalg_eigh` NPU 不支持 → CPU 回退（已声明边界）。
+- 唯一错误：`int(layer)` 解析完整模块名失败。
+- 修复：正则 `\.layers\.(\d+)\.` 提取层号（与 rotation.layer_index_from_name 同源）；
+  无法解析的键跳过并打印。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。

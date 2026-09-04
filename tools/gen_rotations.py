@@ -154,14 +154,21 @@ def main() -> int:
         print("[gen-rotations] ❌ 未捕获到任何 K/V（检查 OSCAR_ASCEND_CALIB 钩子/模型结构）")
         return 4
 
+    import re as _re
+
     D = args.head_dim
     merged = _merge_rank_stats(per_rank, D)
     layers_out = {}
     for layer, st in sorted(merged.items()):
+        m = _re.search(r"\.layers\.(\d+)\.", layer)
+        if m is None:
+            print(f"  ⏭️ 跳过无法解析层号的键: {layer}")
+            continue
+        lid = int(m.group(1))
         r_k, e_k = _rotation_from_stats(st["k"], D, dev)
         r_v, e_v = _rotation_from_stats(st["v"], D, dev)
         layers_out[layer] = {
-            "layer_id": int(layer),
+            "layer_id": lid,
             "rotation": r_k,
             "rotation_v": r_v,
             "eigenvalues": e_k,
