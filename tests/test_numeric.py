@@ -244,6 +244,32 @@ def t_hybrid_detection():
     assert _is_hybrid_config(MC3()) is True, "is_hybrid=True 直接通过"
 
 
+
+def t_attn_type_value_normalize():
+    """_should_oscar 中 attn_type 值比较：str-Enum(str(member)!=value) 场景。"""
+    class FakeAttnType(str):
+        def __new__(cls, v):
+            return super().__new__(cls, v)
+
+        @property
+        def value(self):
+            return str(self)
+
+    DECODER_STR = FakeAttnType("decoder")  # 模拟 str(member)="AttentionType.DECODER"
+    class PlainDecoder:
+        value = "decoder"
+
+    class PlainNotDecoder:
+        value = "encoder"
+
+    def norm(at):
+        v = getattr(at, "value", at)
+        return str(v) == "decoder"
+
+    assert norm(DECODER_STR) is True, "str-Enum value=decoder 应通过"
+    assert norm(PlainDecoder) is True
+    assert norm(PlainNotDecoder) is False
+
 def t_plugin_purity():
     """回归守卫：插件入口文件顶层禁止 vllm_ascend 导入（真机 Docker 循环导入教训）。"""
     import pathlib
@@ -265,6 +291,7 @@ def main():
     check("rotation 检查点加载/缺层回退", t_rotation_loader)
     check("triton store 路径建模(bf16) 字节差=0", t_triton_store_model_bf16)
     check("hybrid 判定纯函数(含兜底)", t_hybrid_detection)
+    check("attn_type 值归一化(str-Enum)", t_attn_type_value_normalize)
     check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0

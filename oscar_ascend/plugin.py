@@ -170,8 +170,12 @@ def _should_oscar(layer, impl) -> bool:
         reasons = []
         if not _is_hybrid_config(mc):
             reasons.append("not-hybrid")
-        if str(getattr(impl, "attn_type", "decoder")) != "decoder":
-            reasons.append(f"attn_type={getattr(impl, 'attn_type', None)!r}")
+        # 值比较：vllm AttentionType 是 str-Enum，str(member)="AttentionType.DECODER"
+        # 而 member.value="decoder"（真机 02:31 SKIP 根因）
+        _at = getattr(impl, "attn_type", "decoder")
+        _at_value = getattr(_at, "value", _at)
+        if str(_at_value) != "decoder":
+            reasons.append(f"attn_type={_at!r}")
         if getattr(impl, "sliding_window", None) is not None:
             reasons.append("sliding-window")
         if getattr(impl, "sinks", None) is not None:

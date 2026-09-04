@@ -47,11 +47,13 @@ C_CFG=$(grep -c "★ OSCAR 配置生效" "$LOG" || true)
 C_WRITE=$(grep -c "★ INT2 写路径首次执行" "$LOG" || true)
 C_READ=$(grep -c "★ INT2 读路径(decode) 首次执行" "$LOG" || true)
 C_SKIP=$(grep -c "\[oscar-ascend\]\[SKIP\]" "$LOG" || true)
+C_NOEAGER=$(grep -c "enforce_eager=False" "$LOG" || true)
 echo "  [1] plugin 注入 OK        : $C_INJECT 次（要求 ≥1）"
 echo "  [2] ★ 类外科手术生效      : $C_SURG 次（要求 ≥1；Qwen3.5 应为 16）"
 echo "  [3] ★ OSCAR 配置生效      : $C_CFG 次（要求 ≥1）"
 echo "  [4] ★ INT2 写路径首次执行 : $C_WRITE 次（信息项：首发请求后出现——您跑 ais_bench 后可见）"
-echo "  [5] ★ INT2 读路径(decode) : $C_READ 次（信息项：首发 decode 后出现）"
+echo "  [5] ★ INT2 读路径(decode) : $C_READ 次（信息项：首发 decode 后出现）
+  [6] enforce_eager=False 行 : $C_NOEAGER 次（警告项：OSCAR 仅 eager 验证；>0 说明未真正生效，见 serve_oscar.sh）"
 [ "$C_SKIP" -gt 0 ] && echo "  ⚠️ 存在 [SKIP] 行（$C_SKIP 条）——请查看拒绝原因" || true
 
 OK=1

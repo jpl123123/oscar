@@ -309,3 +309,15 @@ reflect gate（本记录）→ 待跑
     .item()/.tolist()，仅 eager 验证；PR `_cudagraph_support=NEVER` 同理）。
 - 潜在后续关注：MTP drafter 层（full_attention）手术覆盖与 KV 写入语义；
   graph 模式与 OSCAR 兼容性（当前默认 eager 规避）。
+
+
+## §23 排查闭环（2026-09-04 02:31 真机日志十六）—— SKIP 原因=attn_type 值比较
+
+- 新 [SKIP] 日志给出确切原因：`attn_type=<AttentionType.DECODER: 'decoder'>`。
+- 根因：`str(AttentionType.DECODER)` = "AttentionType.DECODER"（str-Enum 的 __str__），
+  而我的比较用 str() vs "decoder" → 一律误拒（hybrid 修复后仍被此拦）。
+- 修复：值比较 `getattr(at, "value", at)`（= "decoder" 通过）；单测覆盖 str-Enum 场景
+  （11/11 PASS）。
+- 附：本实例日志 `enforce_eager=False`（--enforce-eager 未生效，EAGER_ARGS 数组展开
+  歧义）→ serve_oscar.sh 改字符串 EAGER 变量；check 新增 [6] 警告项（>0 提示未生效）。
+- 下一步：重启后应见 16× ★ 类外科手术 + 写/读路径；随后 ais_bench 验证。

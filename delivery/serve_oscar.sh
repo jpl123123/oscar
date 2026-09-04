@@ -42,8 +42,7 @@ fi
 # 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 默认 --enforce-eager 防图捕获破坏。
 # 想恢复 graph：OSCAR_EAGER=0（不推荐，未验证）。
 ENFORCE_EAGER="${OSCAR_EAGER:-1}"
-EAGER_ARGS=()
-[ "$ENFORCE_EAGER" == "1" ] && EAGER_ARGS=(--enforce-eager)
+if [ "$ENFORCE_EAGER" == "1" ]; then EAGER="--enforce-eager"; else EAGER=""; fi
 
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "qwen3.5" \
