@@ -127,6 +127,10 @@ def main() -> int:
     # 默认 TP4 + 0.9 显存（target serve 同款）：27B W8A8 权重 > 单卡 29.49GiB（实测必 OOM）
     llm_args.setdefault("tensor_parallel_size", 4)
     llm_args.setdefault("gpu_memory_utilization", 0.9)
+    # 与目标 serve 命令一致：GDN 状态必须 BF16（aclnnChunkGatedDeltaRule 仅支持
+    # DT_BFLOAT16；默认 auto 在真机上会生成 FP32 initialState → EZ1001 参数错误）
+    llm_args.setdefault("mamba_cache_dtype", "bfloat16")
+    llm_args.setdefault("mamba_ssm_cache_dtype", "bfloat16")
     llm = LLM(
         model=args.model,
         enforce_eager=True,

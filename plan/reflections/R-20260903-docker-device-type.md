@@ -202,3 +202,15 @@ reflect gate（本记录）→ 待跑
   args 为位置参数元组；我按展开六个参数定义 → 参数缺失。
 - 修复：`_hook(module, args, kwargs=None)`，`k, v = args[1], args[2]`。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §15 后续进展（2026-09-04 01:03 真机日志九）—— GDN state dtype
+
+- 新失败：`aclnnChunkGatedDeltaRule failed ... Tensor params.initialState not implemented
+  for DT_FLOAT, should be in dtype support list [DT_BFLOAT16,]`（generate prefill 首步，
+  GDN linear_attn → npu_chunk_gated_delta_rule）。
+- 根因：校准 LLM 未传 `--mamba-cache-dtype/--mamba-ssm-cache-dtype`（目标 serve 命令有），
+  auto 在真机生成 FP32 initialState → aclnn 只支持 BF16。
+- 修复：gen_rotations `llm_args.setdefault("mamba_cache_dtype", "bfloat16")` +
+  `mamba_ssm_cache_dtype="bfloat16"`（LLM(**kwargs) 透传 EngineArgs，llm.py:65）。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
