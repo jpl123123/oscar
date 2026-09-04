@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """tools/gen_rotations.py — 真机离线生成 OSCAR per-layer 旋转检查点（.pt）。
 
-方法（OSCAR 语义：数据依赖谱旋转）：
-  1. vllm.LLM 跑少量 prompt（BF16 权重路径，本工具为独立进程，不加载插件）；
-  2. 对每个 full-attention 层的 Attention 模块注册 forward 前 hook，捕获**未量化** key/value；
-  3. 每层分别累计 K/V 协方差 → `torch.linalg.eigh`（列=特征向量，按特征值降序）→ 正交 R_k/R_v；
-  4. 保存 {format_version, objective, source_grouping, layers: {i: {layer_id, rotation, eigenvalues}}}。
+方法（vLLM 0.23 API，端到端）：
+  1. 构建 LLM（TP4，0.9 显存；模型装载即完成——不跑 generate）；
+  2. `llm.llm_engine.apply_model(oscar_ascend.calib.capture_cov)`：每个 worker 对
+     已加载模型执行一次纯文本前向，捕获 full-attention 层**未量化** K/V，
+     统计逐层协方差（TP 分片内累计，跨 rank 加权合并）；
+  3. 合并 → `torch.linalg.eigh`（列=特征向量，按特征值降序）→ 正交 R_k/R_v；
+  4. 保存 {layers: {i: {layer_id, rotation(=R_k), rotation_v(=R_v), eigenvalues…}}}。
 
-诚实边界（plan §8 R4）：优先 NPU eigh；NPU 不支持时回退 CPU 并醒目警告——这是
-一次性离线校准，不属推理热路径 CPU 搬运。
-
+诚实边界：优先 NPU eigh；NPU 不支持时 CPU 回退并醒目警告（一次性离线校准，非热路径）。
 用法（真机）：
-  OSCAR_ASCEND_GEN_LLM_ARGS='{"max_model_len":512,"tensor_parallel_size":4}' \
-    python3 tools/gen_rotations.py --model /path/Qwen3.5-27B-w8a8-mtp \
-    --save oscar_rotations.pt --prompts 4 --max-len 128
+  bash delivery/install_and_launch.sh           # 一键内嵌（推荐）
+  OSCAR_ASCEND_GEN_LLM_ARGS='{"tensor_parallel_size":4}' \\
+    python3 tools/gen_rotations.py --model /path/... --save oscar_rotations.pt
 """
 from __future__ import annotations
 
@@ -25,13 +25,10 @@ from pathlib import Path
 
 import torch
 
-
 # 真机实测（2026-09-03 12:58）：多线程父进程 fork 出 EngineCore 后，autograd 线程
 # set_num_threads 触发 "ParallelOpenMP.cpp:64 Invalid thread pool" 硬崩溃。
 # 必须在任何 vllm 导入前设置（vllm.envs 于 import 时读取该值）。
-import os as _os
-
-_os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 def _npu() -> bool:
@@ -44,10 +41,7 @@ def _npu() -> bool:
 
 
 def _force_ascend_platform() -> bool:
-    """自愈：Docker 中 platform 自动激活可能失败（device_type=""），在此强制 NPU。
-
-    成功判定：current_platform.device_type == "npu"。失败不吞异常，交由 diag 定位。
-    """
+    """兜底：platform 未自动激活时强制 NPU（vendor 白名单修复后通常为 no-op）。"""
     try:
         import vllm.platforms as vp
 
@@ -65,168 +59,115 @@ def _force_ascend_platform() -> bool:
         return False
 
 
+def _merge_rank_stats(per_rank: list[dict], D: int) -> dict[str, dict[str, dict]]:
+    """跨 rank 加权合并协方差（均值为 rank 内 E[x]；全局 E[x] 需二次展开）。"""
+    merged: dict[str, dict[str, dict]] = {}
+    for rank_stats in per_rank:
+        for layer, st in rank_stats.items():
+            for kind in ("k", "v"):
+                agg = merged.setdefault(layer, {}).setdefault(
+                    kind,
+                    {"mean_sum": torch.zeros(D), "cov_sum": torch.zeros(D, D), "count": 0},
+                )
+                m = st[kind]["mean"]
+                cv = st[kind]["cov"]
+                c = st[kind]["count"]
+                agg["mean_sum"] = agg["mean_sum"] + m * c
+                agg["cov_sum"] = agg["cov_sum"] + (cv + torch.outer(m, m)) * c
+                agg["count"] += c
+    return merged
+
+
+def _rotation_from_stats(stats: dict, D: int, dev: str) -> tuple[torch.Tensor, torch.Tensor]:
+    c = max(1, int(stats["count"]))
+    mean = stats["mean_sum"] / c
+    cov = stats["cov_sum"] / c - torch.outer(mean, mean)
+    eps = 1e-6 * torch.eye(D)
+    try:
+        evals, evecs = torch.linalg.eigh((cov + eps).to(dev))
+    except Exception as e:
+        print(
+            f"[gen-rotations] ⚠️ NPU eigh 不可用，CPU 回退（离线校准，非热路径）: {e}"
+        )
+        try:
+            evals, evecs = torch.linalg.eigh(cov + eps)
+        except Exception as e2:
+            raise RuntimeError(f"eigh 失败（cov 含 NaN?）: {e2}") from e2
+    idx = torch.argsort(evals, descending=True)
+    return evecs[:, idx].contiguous(), evals[idx]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--save", default="oscar_rotations.pt")
-    ap.add_argument("--prompts", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--head-dim", type=int, default=256)
     args = ap.parse_args()
 
     on_npu = _npu()
     dev = "npu" if on_npu else "cpu"
-    print(f"[gen-rotations] device={dev} prompts={args.prompts} max_len={args.max_len}")
+    print(f"[gen-rotations] device={dev} seq_len={args.max_len}")
 
     if not _force_ascend_platform():
-        print(
-            "[gen-rotations] ❌ 平台未激活（device_type 为空）。请先运行:\n"
-            "    python3 tools/diag_platform.py\n"
-            " 并把输出（或 /tmp/oscar_ascend_logs/selfcheck_*.log）回传。"
-        )
+        print("[gen-rotations] ❌ 平台未激活。请运行 python3 tools/diag_platform.py 并回传输出。")
         return 3
 
-    from vllm import LLM, SamplingParams
-    from vllm.model_executor.layers.attention import Attention
+    from vllm import LLM
 
+    from oscar_ascend import calib
+
+    calib._CALIB_SEQ_LEN = args.max_len  # capture_cov 使用的采样序列长度
     llm_args = json.loads(os.environ.get("OSCAR_ASCEND_GEN_LLM_ARGS", "{}"))
-    # 默认 TP4 + 0.9 显存（目标 serve 同款）：27B W8A8 权重 ~27GB > 单卡 29.49GiB，
-    # TP=1 必然 OOM（真机 2026-09-03 12:54 实测）；用 4 卡切分后每卡 ~6.8GB。
+    # 默认 TP4 + 0.9 显存（target serve 同款）：27B W8A8 权重 > 单卡 29.49GiB（实测必 OOM）
     llm_args.setdefault("tensor_parallel_size", 4)
     llm_args.setdefault("gpu_memory_utilization", 0.9)
     llm = LLM(
         model=args.model,
         enforce_eager=True,
-        max_model_len=args.max_len,
+        max_model_len=max(args.max_len + 16, 128),
         dtype="bfloat16",
         **llm_args,
     )
+    print("[gen-rotations] 引擎就绪，worker 内执行校准前向（apply_model）…")
 
-    # ---- 逐层 hook（键：全局 layer idx）----
-    capture: dict[int, dict[str, list]] = {}
-    hooks = []
+    per_rank = llm.llm_engine.apply_model(calib.capture_cov)
+    if not per_rank or not per_rank[0]:
+        print("[gen-rotations] ❌ 未捕获到任何 K/V（检查模型结构/apply_model 支持）")
+        return 4
 
-    def _make_hook(i):
-        def _hook(module, q, k, v, kv_cache, attn_metadata, output):
-            if k is None or v is None:
-                return None
-            d = capture.setdefault(i, {"k": [], "v": []})
-            d["k"].append(k.detach().float())
-            d["v"].append(v.detach().float())
-            return None
-
-        return _hook
-
-    def _find_layers(mod):
-        """递归定位 base decoder layers（Qwen3.5 结构可能包一层 language_model/model）。"""
-        for attr in ("layers",):
-            sub = getattr(mod, attr, None)
-            if sub is not None and len(sub) > 0:
-                return sub
-        for attr in ("language_model", "model", "transformer", "language_model.model"):
-            sub = mod
-            ok = True
-            for part in attr.split("."):
-                sub = getattr(sub, part, None)
-                if sub is None:
-                    ok = False
-                    break
-            if ok and hasattr(sub, "layers") and len(sub.layers) > 0:
-                return sub.layers
-        raise SystemExit("未找到模型 decoder layers（结构不符，请检查模型类）")
-
-    model_mod = llm.model.model if hasattr(llm.model, "model") else llm.model
-    layers = _find_layers(model_mod)
-    for i, layer in enumerate(layers):
-        attn = getattr(layer, "self_attn", None)
-        module = getattr(attn, "attn", None)
-        if isinstance(module, Attention):
-            hooks.append((i, module.register_forward_pre_hook(_make_hook(i))))
-            print(f"  hooked model.layers.{i}.self_attn.attn")
-
-    got_layers = sum(1 for i, _ in hooks)
-    assert got_layers > 0, "未找到 full-attention Attention 模块（模型结构不符）"
-
-    prompts = [
-        f"这是用于 OSCAR 旋转校准的文本序列 #{i}。"
-        "量子计算与自然语言处理都是非结构化数据上的双重挑战。" * 2
-        for i in range(args.prompts)
-    ]
-    llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
-    for _, h in hooks:
-        h.remove()
-    n_tokens = sum(len(v["k"]) * 0 + sum(t.shape[0] for t in v["k"]) for v in capture.values())
-    print(f"  captured tokens={n_tokens}")
-
-    # ---- 逐层旋转 ----
     D = args.head_dim
+    merged = _merge_rank_stats(per_rank, D)
     layers_out = {}
-    cpu_warned = False
-    for i, d in sorted(capture.items()):
-        k = torch.cat([t.reshape(-1, t.shape[-1]) for t in d["k"]], dim=0)[:, :D]
-        v = torch.cat([t.reshape(-1, t.shape[-1]) for t in d["v"]], dim=0)[:, :D]
-        if k.shape[0] < 8:
-            continue
-
-        def _rotation(x: torch.Tensor):
-            nonlocal cpu_warned
-            xc = x - x.mean(dim=0, keepdim=True)
-            cov = (xc.t() @ xc) / max(1, xc.shape[0])
-            eps = 1e-6 * torch.eye(D, dtype=cov.dtype, device=cov.device)
-            try:
-                evals, evecs = torch.linalg.eigh(cov + eps)
-            except Exception as e:
-                if not cpu_warned:
-                    cpu_warned = True
-                    print(
-                        "[gen-rotations] ⚠️ NPU eigh 不可用，CPU 回退（离线校准，非热路径；"
-                        f"原因: {e}）"
-                    )
-                evals, evecs = torch.linalg.eigh((cov + eps).cpu())
-            idx = torch.argsort(evals, descending=True)
-            return evecs[:, idx].contiguous(), evals[idx]
-
-        r_k, e_k = _rotation(k)
-        r_v, e_v = _rotation(v)
-        layers_out[str(i)] = {
-            "layer_id": int(i),
-            "rotation_k": r_k,
+    for layer, st in sorted(merged.items()):
+        r_k, e_k = _rotation_from_stats(st["k"], D, dev)
+        r_v, e_v = _rotation_from_stats(st["v"], D, dev)
+        layers_out[layer] = {
+            "layer_id": int(layer),
+            "rotation": r_k,
             "rotation_v": r_v,
-            "eigenvalues_k": e_k,
+            "eigenvalues": e_k,
             "eigenvalues_v": e_v,
         }
-        print(f"  layer {i}: tokens={k.shape[0]} R_k/R_v ok")
+        print(f"  layer {layer}: count={st['k']['count']} R_k/R_v ok")
 
-    assert layers_out, "无可用于旋转的捕获数据（prompt 过短或 hook 未命中）"
-
-    # rotation.py 兼容格式（PR：layers[i].rotation）；K/V 共用 rotation 字段 → 采用 K 旋转，
-    # V 由同文件 rotation_v 提供（backend 从环境变量 V 路径读取同一文件即可）。
+    assert layers_out, "无可用于旋转的统计"
     out = {
         "format_version": 1,
         "objective": "qqt_r_h_pbr",
         "source_grouping": "layer",
         "layers": {
-            k: {
-                "layer_id": v["layer_id"],
-                "rotation": v["rotation_k"],
-                "rotation_v": v["rotation_v"],
-                "eigenvalues": v["eigenvalues_k"],
-                "eigenvalues_v": v["eigenvalues_v"],
-            }
+            k: {kk: (vv.cpu() if isinstance(vv, torch.Tensor) else vv)
+                for kk, vv in v.items()}
             for k, v in layers_out.items()
         },
     }
     Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-    # 统一落 CPU（torch.save NPU tensor 需 device 上下文，落盘前移 CPU 更稳）
-    for v in out["layers"].values():
-        for key in ("rotation", "rotation_v", "eigenvalues", "eigenvalues_v"):
-            if isinstance(v.get(key), torch.Tensor):
-                v[key] = v[key].cpu()
     torch.save(out, args.save)
     print(f"[gen-rotations] saved {args.save}（layers={len(out['layers'])} / D={D}）")
     print(
         "  启动时: OSCAR_ASCEND_K_ROTATION_PATH=该文件 OSCAR_ASCEND_V_ROTATION_PATH=该文件\n"
-        "  （rotation_v 字段被同一文件读取，见 rotation.py/backend.py）"
+        "  （K 用 rotation 字段，V 用 rotation_v 字段，见 rotation.py）"
     )
     return 0
 

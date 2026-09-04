@@ -146,3 +146,17 @@ reflect gate（本记录）→ 待跑
 - 保留项：VLLM_WORKER_MULTIPROC_METHOD=spawn（fork 线程池崩溃独立问题，仍有效）。
 - 本记录保持 OPEN；退出条件：平台自动激活（不再依赖强制引导日志）→ 校准成功 →
   probe → serve。
+
+
+## §11 后续进展（2026-09-04 00:06 真机日志五）—— 平台全通，采样 API 修复
+
+- 平台链路**完全打通**：diag [3] `发现的 platform 插件: ['ascend']`、[4]
+  `qualname=vllm_ascend.platform.NPUPlatform`、[5] `device_type='npu'`；EngineCore + 4
+  workers 全部启动，TP4 装载 8.5GB/rank 权重，KV cache 16.36GiB/rank，engine init 59.7s。
+- 新失败（我们工具链自身）：`gen_rotations.py:138 AttributeError: 'LLM' object has no
+  attribute 'model'` —— vLLM 0.23 的 LLM 不暴露 model（模型在 worker 进程）。
+- 修复：改用官方通道 `llm.llm_engine.apply_model(fn)`（llm_engine.py:419 →
+  worker_base.py:128 `fn(self.get_model())`）：新增 `oscar_ascend/calib.py::capture_cov`
+  （模块级可 pickle），worker 内对已加载模型做一次纯文本前向，Attention 前向钩子捕获
+  未量化 K/V → 逐层协方差（TP 分片累计）→ 父进程跨 rank 加权合并 → eigh → 保存。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
