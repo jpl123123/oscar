@@ -265,3 +265,14 @@ reflect gate（本记录）→ 待跑
 - 修复：format.quantize 改为 `floor((x-zero)/scale + 0.5)`（N-02 原文）；本地镜像 8/8。
 - serve 已进入启动阶段（日志到"启动 vllm serve"）——待用户回传 serve 段确认
   plugin 注入 OK / 首个请求。
+
+
+## §20 后续进展（2026-09-04 01:29 真机日志十四）—— 理想重建语义同步
+
+- `format.quantize` 改 floor(x+0.5)（N-02，与 Triton 一致）后，probe ref：
+  store 字节差=0 ✅ 但 dequant err K=2.969 V=2.844 ❌（上一轮为 0.0）。
+- 根因：probe/test 的"理想重建"仍用 torch.round（银行家舍入）；bf16 值在 .5 边界
+  上 floor/round 高频分歧 → 与存入字节的 q 不一致（triton 9 字节差同一根因）。
+- 修复：probe_oscar / test_numeric 的理想 q 全部同步为 `floor(x+0.5)`；
+  本地镜像 8/8 复验。
+- 本记录保持 OPEN；退出条件：probe 0/0/0 → serve 首请求。

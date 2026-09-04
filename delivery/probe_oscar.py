@@ -83,8 +83,8 @@ def main() -> int:
     k_rec, v_rec = dequant_split_ref(k8, v8, bnums, pos, Hk, D)   # [N,Hk,D]
     _, ks, kz = fmt.quantize(k.float())
     _, vs, vz = fmt.quantize(v.float())
-    qk = torch.clamp(torch.round((k.float() - kz) / ks), 0, 3)
-    qv = torch.clamp(torch.round((v.float() - vz) / vs), 0, 3)
+    qk = torch.clamp(torch.floor((k.float() - kz) / ks + 0.5), 0, 3)
+    qv = torch.clamp(torch.floor((v.float() - vz) / vs + 0.5), 0, 3)
     ek = (k_rec - (qk * ks + kz)).abs().max().item()
     ev = (v_rec - (qv * vs + vz)).abs().max().item()
     if max(ek, ev) > 1e-5:

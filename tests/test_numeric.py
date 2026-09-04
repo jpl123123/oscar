@@ -58,7 +58,7 @@ def t_quant_dequant():
     for x in (k, v):
         packed, scale, zero = fmt.quantize(x)
         rec = fmt.dequant(packed, scale, zero, x.shape[-1])
-        q = torch.clamp(torch.round((x.float() - zero) / scale), 0, 3)
+        q = torch.clamp(torch.floor((x.float() - zero) / scale + 0.5), 0, 3)
         ideal = q * scale + zero
         err = (rec - ideal).abs().max().item()
         assert err <= fmt.DEQUANT_TOL, f"dequant err={err:.3e}"
@@ -70,8 +70,8 @@ def t_slot_roundtrip():
     kr, vr = fmt.parse_slot_bytes(slot, k.shape[-1])
     _, ks, kz = fmt.quantize(k)
     _, vs, vz = fmt.quantize(v)
-    qk = torch.clamp(torch.round((k.float() - kz) / ks), 0, 3)
-    qv = torch.clamp(torch.round((v.float() - vz) / vs), 0, 3)
+    qk = torch.clamp(torch.floor((k.float() - kz) / ks + 0.5), 0, 3)
+    qv = torch.clamp(torch.floor((v.float() - vz) / vs + 0.5), 0, 3)
     e = max(
         (kr - (qk * ks + kz)).abs().max().item(),
         (vr - (qv * vs + vz)).abs().max().item(),
