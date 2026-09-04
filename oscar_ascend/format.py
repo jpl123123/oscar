@@ -84,11 +84,17 @@ def dequant(
 
 
 def _unpack(packed: torch.Tensor, D: int) -> torch.Tensor:
-    """一字节 4×INT2 → [.., D] int32（N-03 位序）。"""
-    p = packed.to(torch.int32).unsqueeze(-1)
-    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=packed.device)
-    q = (p >> shifts) & (LEVELS - 1)  # [.., D/4, 4]
-    return q.reshape(*q.shape[:-2], D)
+    """一字节 4×INT2 → [.., D] int32（N-03 位序）。
+
+    注意：torch-npu 的 `>>` 不支持张量广播（aclnnRightShift 要求同形，真机
+    01:18 EZ1001），解包改用**算术链**（整除/取模，字节值 0..255 精确）。
+    """
+    p = packed.to(torch.int32)  # [.., D/4]
+    q0 = p % LEVELS
+    q1 = (p // LEVELS) % LEVELS
+    q2 = (p // (LEVELS * LEVELS)) % LEVELS
+    q3 = (p // (LEVELS * LEVELS * LEVELS)) % LEVELS
+    return torch.stack([q0, q1, q2, q3], dim=-1).reshape(*p.shape[:-1], D)
 
 
 def f16_le(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

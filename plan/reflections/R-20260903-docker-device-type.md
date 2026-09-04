@@ -225,3 +225,20 @@ reflect gate（本记录）→ 待跑
 - 修复：正则 `\.layers\.(\d+)\.` 提取层号（与 rotation.layer_index_from_name 同源）；
   无法解析的键跳过并打印。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §17 后续进展（2026-09-04 01:18 真机日志十一）—— 校准达成 + probe 首个算子缺陷
+
+- **校准正式达成**：`saved /workspace/new_oscar_triton/oscar_rotations.pt（layers=16 / D=256）`
+  （16 个 FULL 层、每层 count=264、R_k/R_v ok、eigh 走 CPU 回退已声明）。
+- probe(ref) 首项通过：`✅ store 字节差 = 0`；随后 dequant 失败：
+  `call aclnnRightShift failed ... Shape of out should be [3,8,64,4], but current is
+  [3,8,64,1]` —— torch-npu 的 `>>` **不支持张量广播**（scalar `&`/`<<` 均正常，
+  证据=store 含 meta/打包全部字节差 0）。
+- 修复：
+  * format._unpack 改**算术链**（`%`/整除，字节值 0..255 精确）；本地镜像 8/8 复验。
+  * Triton 改为显式开关（默认 torch 参考路径；`OSCAR_ASCEND_USE_TRITON=1` 才启用）——
+    保障端到端先通，Triton-ascend 作为后续验收项。
+  * 一键脚本 triton probe 默认**观察模式**（不阻断，`OSCAR_ASCEND_REQUIRE_TRITON=1`
+    才硬门禁）；服务端 torch 路径未动。
+- 本记录保持 OPEN；退出条件：probe 全 PASS → serve 注入 OK → sampler 首轮。

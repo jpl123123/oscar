@@ -79,7 +79,9 @@ class OscarAscendConfig:
             recent_tokens=max(0, _env_int("OSCAR_ASCEND_RECENT_TOKENS", 256)),
             staging_tokens=max(0, _env_int("OSCAR_ASCEND_STAGING_TOKENS", 8192)),
             group_size=_env_int("OSCAR_ASCEND_GROUP_SIZE", 0),
-            use_triton=os.environ.get("OSCAR_ASCEND_FORCE_TORCH", "0") != "1",
+            # 真机 01:18 实测 torch-npu 位运算偏 `>>` 向量广播 bug；Triton-ascend 未上机验证
+            # → 默认 torch 参考路径（全 NPU 算子），显式 OSCAR_ASCEND_USE_TRITON=1 才启用 Triton
+            use_triton=os.environ.get("OSCAR_ASCEND_USE_TRITON", "0") == "1",
             verbose=os.environ.get("OSCAR_ASCEND_VERBOSE", "1") != "0",
         )
         cfg.extra["enable"] = os.environ.get("OSCAR_ASCEND_ENABLE", "auto")

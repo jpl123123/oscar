@@ -145,10 +145,16 @@ if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
     "$PYTHON" delivery/probe_oscar.py --mode ref \
         || fail "数值 probe(ref) FAIL —— 拒绝 serve"
     if $PYTHON -c "from vllm.triton_utils import HAS_TRITON; import sys; sys.exit(0 if HAS_TRITON else 1)"; then
-        "$PYTHON" delivery/probe_oscar.py --mode triton \
-            || fail "数值 probe(triton) FAIL —— 拒绝 serve"
+        # Triton-ascend 尚未上机验收（torch-npu 位运算已有缺陷先例）；默认观察不阻断，
+        # OSCAR_ASCEND_REQUIRE_TRITON=1 时才作为硬门禁
+        if [ "${OSCAR_ASCEND_REQUIRE_TRITON:-0}" == "1" ]; then
+            "$PYTHON" delivery/probe_oscar.py --mode triton \
+                || fail "数值 probe(triton) FAIL（REQUIRE_TRITON=1）—— 拒绝 serve"
+        else
+            "$PYTHON" delivery/probe_oscar.py --mode triton || echo "  ⚠️ triton probe 未通过（观察模式，服务走 torch 参考路径）"
+        fi
     else
-        echo "  HAS_TRITON=False → 跳过 triton probe（服务将走 torch 参考路径，性能未达最优）"
+        echo "  HAS_TRITON=False → 跳过 triton probe（服务将走 torch 参考路径）"
     fi
 else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
