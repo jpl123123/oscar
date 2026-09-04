@@ -47,16 +47,15 @@ def register_attention_hook(attn_module) -> None:
         # Attention.forward(query, key, value, kv_cache, attn_metadata, output)
         if not args or len(args) < 3:
             return None
-        k, v = args[1], args[2]
-        if k is None or v is None:
+        q, k, v = args[0], args[1], args[2]
+        if k is None or v is None or q is None:
             return None
-        d = _captures.setdefault(layer_name, {"k": [], "v": []})
+        d = _captures.setdefault(layer_name, {"q": [], "k": [], "v": []})
         cur = sum(t.shape[0] for t in d["k"])
         if cur >= _TOKEN_CAP:
             return None
-        take = k.shape[0]
-        if cur + take > _TOKEN_CAP:
-            take = _TOKEN_CAP - cur
+        take = min(k.shape[0], _TOKEN_CAP - cur)
+        d["q"].append(q[:take].detach().float())
         d["k"].append(k[:take].detach().float())
         d["v"].append(v[:take].detach().float())
         return None
@@ -72,25 +71,49 @@ def reset_captures(model=None) -> None:
 
 
 def finalize_cov(model=None) -> dict:
-    """worker 内读取钩子缓冲 → 协方差统计（无任何 model 前向）。
+    """worker 内读取钩子缓冲 → 旋转校准统计（无任何 model 前向）。
 
-    返回 {layer_name: {"k": {"mean","cov","count"}, "v": {...}}}，张量已 CPU。
+    返回 {layer_name: {"q": Σ_Q, "v": Σ_S, "count"}}：
+      Σ_Q = (1/H_kv) Σ_h Q_g^T Q_g / n  —— K 旋转的 hessian（qqt 目标，论文
+      compute_kv_rotation.py:93-108 / README:312）；
+      Σ_S = (1/H_kv) Σ_h (V_h·√w)^T(V_h·√w)/n，w_i=(k_i^T Σ_Qh k_i) —— V 旋转的
+      score-weighted（sst 目标，compute_kv_rotation.py:111-136）。
+    张量已 CPU。
     """
     out = {}
     for layer_name, d in _captures.items():
-        if not d["k"]:
+        if not d["k"] or not d["q"]:
             continue
-        k = torch.cat(d["k"], dim=0).reshape(-1, d["k"][0].shape[-1])
-        v = torch.cat(d["v"], dim=0).reshape(-1, d["v"][0].shape[-1])
-        if k.shape[0] < 4:
-            continue
+        q = torch.cat(d["q"], dim=0)
+        k = torch.cat(d["k"], dim=0)
+        v = torch.cat(d["v"], dim=0)
+        n_hq = q.shape[1]
+        n_hk = k.shape[1]
+        g = n_hq // n_hk
+        n = k.shape[0]
 
-        def _stats(x: torch.Tensor) -> dict:
-            x = x.float()
-            mean = x.mean(dim=0)
-            xc = x - mean.unsqueeze(0)
-            cov = (xc.t() @ xc) / max(1, xc.shape[0])
-            return {"mean": mean.cpu(), "cov": cov.cpu(), "count": int(xc.shape[0])}
+        def _sym(x: torch.Tensor) -> torch.Tensor:
+            return (x + x.T) / 2
 
-        out[layer_name] = {"k": _stats(k), "v": _stats(v)}
+        def _eigh_dims_stats(x: torch.Tensor) -> torch.Tensor:
+            return _sym(x.float().reshape(-1, x.shape[-1]).t() @ x.float().reshape(-1, x.shape[-1]) / x.shape[0])
+
+        cov_q = torch.zeros(q.shape[-1], q.shape[-1], dtype=torch.float64)
+        cov_s = torch.zeros(v.shape[-1], v.shape[-1], dtype=torch.float64)
+        for h in range(n_hk):
+            qg = q[:, h * g : (h + 1) * g, :].float().reshape(-1, q.shape[-1])
+            kh = k[:, h, :].float()
+            vh = v[:, h, :].float()
+            qtq = _sym(qg.t() @ qg / qg.shape[0])
+            cov_q += qtq
+            weights = (kh @ qtq * kh).sum(1)
+            weights = weights / weights.sum().clamp(min=1e-12) * n
+            vw = vh * weights.unsqueeze(1).sqrt()
+            cov_s += _sym(vw.t() @ vw / n)
+        cov_q = cov_q / n_hk
+        cov_s = cov_s / n_hk
+        out[layer_name] = {
+            "q": {"cov": cov_q.cpu(), "count": n},
+            "v": {"cov": cov_s.cpu(), "count": n},
+        }
     return out

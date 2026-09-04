@@ -44,6 +44,13 @@ def _resolve_lid(key) -> int | None:
 @lru_cache(maxsize=8)
 def _load_checkpoint(path: str) -> dict[int, dict[str, torch.Tensor]]:
     obj = torch.load(path, map_location="cpu", weights_only=False)
+    if not (isinstance(obj, dict) and obj.get("format_version", 0) >= 2
+            and "r_h_pbr" in str(obj.get("objective", ""))):
+        print(
+            f"[oscar-ascend] ⚠️ 旋转检查点 {path!r} 非 v2 配方（缺 U@H@P_br 组合；"
+            "format_version/objective 检查未通过）——per-vector INT2 精度将显著劣化；"
+            "请重新运行校准（delivery/install_and_launch.sh 会自动触发）。"
+        )
     out: dict[int, dict[str, torch.Tensor]] = {}
     if isinstance(obj, dict) and "layers" in obj:
         for k, entry in obj["layers"].items():

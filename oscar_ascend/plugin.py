@@ -161,7 +161,27 @@ _SKIP_REASONS_LOGGED: set = set()
 
 
 def _should_oscar(layer, impl) -> bool:
-    """hybrid 模型的 decoder full-attention 层（plan §5.5）；失败打印拒绝原因（首个即可）。"""
+    """hybrid 模型的 decoder full-attention 层（plan §5.5）；失败打印拒绝原因（首个即可）。
+
+    MTP 草稿层拒绝在先（纯函数判定）：草稿 KV 必须保持 BF16——
+      ① 参考实现从未验证 MTP/投机解码下的 INT2 草稿 KV（论文 README:292 甚至声明
+         混合模型不支持；PR oscar_gpqa_eval 只用非 MTP 非混合 Qwen3-32B）；
+      ② vllm-ascend 草稿层 attention 的 attn_state=SpecDecoding（model_runner_v1.py
+        :1483-1486），本插件无 SpecDecoding 专用分支（原生走 forward_fused_infer_attention
+        含 metadata attn_mask；插件走 prefill 重建因果掩码，语义未对齐）；
+      ③ 草稿只是 1/68 层，BF16 成本可忽略，而 INT2 草稿 KV 直接击穿 MTP 接受率。
+    （拒绝发生在 get_current_vllm_config 之前 → 无 vllm 环境也可单测。）
+    """
+    layer_name = getattr(layer, "layer_name", "") or ""
+    if ".mtp." in layer_name or layer_name.startswith("mtp."):
+        key = "mtp-draft"
+        if key not in _SKIP_REASONS_LOGGED:
+            _SKIP_REASONS_LOGGED.add(key)
+            print(
+                f"[oscar-ascend][SKIP] {layer_name} → 不替换: {key} "
+                f"（MTP 草稿层 KV 保持 BF16，原生 SpecDecoding 路径；1/68 层成本可忽略）"
+            )
+        return False
     try:
         from vllm.config import get_current_vllm_config
 

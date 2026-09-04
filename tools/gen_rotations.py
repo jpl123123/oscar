@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """tools/gen_rotations.py — 真机离线生成 OSCAR per-layer 旋转检查点（.pt）。
 
-方法（vLLM 0.23 API，端到端）：
+方法（vLLM 0.23 API，端到端；对齐 OSCAR 论文/PR 已验证配方）：
   1. 构建 LLM（TP4，0.9 显存；模型装载即完成——不跑 generate）；
   2. `llm.llm_engine.apply_model(oscar_ascend.calib.capture_cov)`：每个 worker 对
-     已加载模型执行一次纯文本前向，捕获 full-attention 层**未量化** K/V，
-     统计逐层协方差（TP 分片内累计，跨 rank 加权合并）；
-  3. 合并 → `torch.linalg.eigh`（列=特征向量，按特征值降序）→ 正交 R_k/R_v；
+     已加载模型执行一次纯文本前向，捕获 full-attention 层**未量化** Q/K/V，
+     统计 attention-aware 协方差（worker 内完成 qqt/sst，跨 rank 加权合并）；
+  3. 合并 → `torch.linalg.eigh` → 逐层组合旋转 **R = U @ H @ P_br**
+     （论文 compute_kv_rotation.py:234-265 的 `r_h_pbr` 默认验证配方：
+      U=hessian 特征向量、H=Hadamard、P_br=按特征值位反转置换，
+      把高方差方向均匀摊开，避免 per-vector INT2 min/max 被离群方向主导）；
   4. 保存 {layers: {i: {layer_id, rotation(=R_k), rotation_v(=R_v), eigenvalues…}}}。
+
+校准目标（论文 README:312-318）：
+  K 旋转 hessian = Σ_Q = (1/H_kv)·Σ_h Q_h^T Q_h / n   （qqt）
+  V 旋转 hessian = Σ_S = (1/H_kv)·Σ_h (V_h√w)^T(V_h√w)/n，w_i = k_i^T Σ_Qh k_i （sst，score-weighted）
 
 诚实边界：优先 NPU eigh；NPU 不支持时 CPU 回退并醒目警告（一次性离线校准，非热路径）。
 用法（真机）：
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -63,41 +71,81 @@ def _force_ascend_platform() -> bool:
 
 
 def _merge_rank_stats(per_rank: list[dict], D: int) -> dict[str, dict[str, dict]]:
-    """跨 rank 加权合并协方差（均值为 rank 内 E[x]；全局 E[x] 需二次展开）。"""
+    """跨 rank 加权合并协方差（每 rank 协方差已按 token 平均；按 count 加权）。"""
     merged: dict[str, dict[str, dict]] = {}
     for rank_stats in per_rank:
         for layer, st in rank_stats.items():
-            for kind in ("k", "v"):
+            for kind in ("q", "v"):
                 agg = merged.setdefault(layer, {}).setdefault(
                     kind,
-                    {"mean_sum": torch.zeros(D), "cov_sum": torch.zeros(D, D), "count": 0},
+                    {"cov_sum": torch.zeros(D, D), "count": 0},
                 )
-                m = st[kind]["mean"]
-                cv = st[kind]["cov"]
+                cov = st[kind]["cov"]
                 c = st[kind]["count"]
-                agg["mean_sum"] = agg["mean_sum"] + m * c
-                agg["cov_sum"] = agg["cov_sum"] + (cv + torch.outer(m, m)) * c
+                agg["cov_sum"] = agg["cov_sum"] + cov * c
                 agg["count"] += c
     return merged
 
 
+# ---------------------------------------------------------------------------
+# 旋转组合（论文 compute_kv_rotation.py:23-46, 234-265 移植）
+# ---------------------------------------------------------------------------
+def build_hadamard(n: int) -> torch.Tensor:
+    """[n,n] 归一化 Hadamard（n 必须 2 的幂）。"""
+    if n < 1 or n & (n - 1):
+        raise ValueError(f"Hadamard size must be a power of two, got {n}")
+    if n == 1:
+        return torch.ones(1, 1, dtype=torch.float64)
+    h = build_hadamard(n // 2)
+    return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0) / math.sqrt(2)
+
+
+def bit_reversal_perm(d: int) -> torch.Tensor:
+    if d < 1 or d & (d - 1):
+        raise ValueError(f"Bit-reversal size must be a power of two, got {d}")
+    bits = int(math.log2(d))
+    return torch.tensor([int(bin(i)[2:].zfill(bits)[::-1], 2) for i in range(d)])
+
+
+def make_br_perm_matrix(eigenvalues: torch.Tensor) -> torch.Tensor:
+    """P_br：按特征值（降序）排序后位反转放置——高方差方向均匀交错。"""
+    d = len(eigenvalues)
+    sorted_idx = torch.argsort(eigenvalues, descending=True)
+    br = bit_reversal_perm(d)
+    perm = torch.zeros(d, dtype=torch.long)
+    for i in range(d):
+        perm[br[i]] = sorted_idx[i]
+    return torch.eye(d, dtype=torch.float64)[:, perm]
+
+
+def compose_rotation(rotation: torch.Tensor, eigvals: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
+    """R · H · P_br（论文默认验证配方 r_h_pbr）。"""
+    pbr = make_br_perm_matrix(eigvals)
+    return rotation @ hadamard @ pbr
+
+
 def _rotation_from_stats(stats: dict, D: int, dev: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """hessian 协方差 → (R = U·H·P_br, eigenvalues)（fp64 计算后转 fp32）。"""
     c = max(1, int(stats["count"]))
-    mean = stats["mean_sum"] / c
-    cov = stats["cov_sum"] / c - torch.outer(mean, mean)
+    cov = stats["cov_sum"] / c
     eps = 1e-6 * torch.eye(D)
+    cov64 = (cov.double() + cov.double().T) / 2
     try:
-        evals, evecs = torch.linalg.eigh((cov + eps).to(dev))
+        evals, evecs = torch.linalg.eigh((cov64 + eps.double()).to(dev))
     except Exception as e:
         print(
             f"[gen-rotations] ⚠️ NPU eigh 不可用，CPU 回退（离线校准，非热路径）: {e}"
         )
         try:
-            evals, evecs = torch.linalg.eigh(cov + eps)
+            evals, evecs = torch.linalg.eigh(cov64 + eps.double())
         except Exception as e2:
             raise RuntimeError(f"eigh 失败（cov 含 NaN?）: {e2}") from e2
-    idx = torch.argsort(evals, descending=True)
-    return evecs[:, idx].contiguous(), evals[idx]
+    H = build_hadamard(D)
+    rot = compose_rotation(evecs, evals, H)
+    err = (rot @ rot.T - torch.eye(D, dtype=torch.float64)).abs().max().item()
+    if err > 1e-6:
+        print(f"[gen-rotations] ⚠️ 组合旋转正交误差 {err:.2e}（eigh 精度；继续）")
+    return rot.float().contiguous(), evals.float().contiguous()
 
 
 def main() -> int:
@@ -167,7 +215,8 @@ def main() -> int:
             print(f"  ⏭️ 跳过无法解析层号的键: {layer}")
             continue
         lid = int(m.group(1))
-        r_k, e_k = _rotation_from_stats(st["k"], D, dev)
+        # K 旋转 ← Σ_Q（qqt）；V 旋转 ← Σ_S（sst）；组合 R = U·H·P_br
+        r_k, e_k = _rotation_from_stats(st["q"], D, dev)
         r_v, e_v = _rotation_from_stats(st["v"], D, dev)
         layers_out[str(lid)] = {   # 键 = 层号字符串（rotation._load_checkpoint 按 int/lid 索引）
             "layer_id": lid,
@@ -176,12 +225,12 @@ def main() -> int:
             "eigenvalues": e_k,
             "eigenvalues_v": e_v,
         }
-        print(f"  layer {layer}: count={st['k']['count']} R_k/R_v ok")
+        print(f"  layer {layer}: count={st['q']['count']} R_k/R_v ok (U@H@Pbr)")
 
     assert layers_out, "无可用于旋转的统计"
     out = {
-        "format_version": 1,
-        "objective": "qqt_r_h_pbr",
+        "format_version": 2,   # v2 = U@H@P_br 组合配方（install_and_launch 按此强制重校准）
+        "objective": "qqt_r_h_pbr_k / sst_r_h_pbr_v",
         "source_grouping": "layer",
         "layers": {
             k: {kk: (vv.cpu() if isinstance(vv, torch.Tensor) else vv)

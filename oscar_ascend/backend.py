@@ -64,14 +64,18 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             if not self._oscar_warned_quantile:
                 self._oscar_warned_quantile = True
                 print(
-                    "[oscar-ascend] 使用 torch.quantile 裁剪（NPU 支持未正式验证；"
-                    "失败将跳过裁剪并继续）"
+                    "[oscar-ascend] 裁剪实现 = 排序分位数（sort-based，对齐论文内核"
+                    " test_oscar_rotation_clip_int2.py；不依赖 torch.quantile）"
                 )
             try:
-                thr = torch.quantile(x_rot.abs(), clip_ratio, dim=-1, keepdim=True)
+                # 论文内核同款：idx = int(ratio*D)，阈值 = 第 idx 大 |x|（per-vector）
+                D = x_rot.shape[-1]
+                idx = min(int(clip_ratio * D), D - 1)
+                sorted_abs, _ = x_rot.abs().sort(dim=-1)
+                thr = sorted_abs[..., idx : idx + 1]
                 x_rot = torch.clamp(x_rot, -thr, thr)
             except Exception as e:  # pragma: no cover
-                print(f"[oscar-ascend] quantile 裁剪不可用，跳过: {e}")
+                print(f"[oscar-ascend] sort 裁剪不可用，跳过: {e}")
         return x_rot
 
     # ------------------------------------------------------------------ 写路径

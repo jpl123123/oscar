@@ -306,6 +306,98 @@ def t_plugin_purity():
     assert not top, f"插件顶层仍含 vllm_ascend 导入: {top}"
 
 
+def t_rotation_composition_quality_floor():
+    """精度地板（双向证据，R-20260904-oscar-int2-mtp-precision 复现核心）：
+
+    旧校准（纯特征向量 U，无 Hadamard/位反置换，论文已弃用）做 per-vector INT2，
+    在"离群通道"K/V 上 ≈ 噪声（relL2 ≥ 1.0）；
+    新校准（U @ H @ P_br，论文 r_h_pbr 默认配方）在同一数据上 relL2 ≤ 0.60。
+    注意：本测试不拷贝任何真机数值——数据为合成离群分布（内核语义推导）。
+    """
+    import tools.gen_rotations as g
+
+    D, N = 256, 512
+    torch.manual_seed(7)
+    chan = torch.ones(D)
+    chan[:4] = 24.0          # 离群通道（LLM KV 典型 massive/outlier 通道）
+    chan[4:12] = 8.0
+    chan[12:24] = 2.5
+    amp = torch.exp(0.4 * torch.randn(N, 1, 1))          # 每 token·head 幅值漂移
+    K = torch.randn(N, 1, D) * chan * amp
+
+    # 旧配方：协方差特征向量（降序）—— 对应修复前 gen_rotations._rotation_from_stats
+    xf = K.reshape(-1, D).float()
+    cov = xf.t() @ xf / xf.shape[0]
+    evals, evecs = torch.linalg.eigh(cov + 1e-6 * torch.eye(D, dtype=torch.float64))
+    order = torch.argsort(evals, descending=True)
+    U_old = evecs[:, order].float().contiguous()
+    # 新配方：U @ H @ P_br（论文 compose_rotation("r_h_pbr")）
+    R_new = g.compose_rotation(
+        evecs[:, order], evals[order], g.build_hadamard(D)
+    ).float().contiguous()
+
+    err = (R_new @ R_new.T - torch.eye(D)).abs().max().item()
+    assert err < 1e-4, f"U@H@P 非正交（err={err:.2e}）"
+
+    def pervec_rel(x_rot):
+        packed, scale, zero = fmt.quantize(x_rot.float())
+        rec = fmt.dequant(packed, scale, zero, D)
+        return (rec - x_rot.float()).norm() / x_rot.float().norm()
+
+    r_old = pervec_rel(K.float() @ U_old)
+    r_new = pervec_rel(K.float() @ R_new)
+    print(f"    [quality] 纯U relL2={r_old:.3f}  U@H@P relL2={r_new:.3f}")
+    assert r_old >= 1.0, f"旧配方（纯 U）异常接近无损（{r_old:.3f}），夹具未模拟离群？"
+    assert r_new <= 0.60, f"新配方（U@H@P）仍在噪声级（{r_new:.3f}）"
+
+
+def t_clip_sort_threshold():
+    """裁剪实现 = 排序分位数（对齐论文内核，替代 torch.quantile 的 NPU 未验证依赖）。"""
+    D = 32
+    x = torch.randn(4, 1, D) * torch.tensor([1.0, 3.0, 8.0, 24.0]).view(4, 1, 1)
+    ratio = 0.75
+    idx = min(int(ratio * D), D - 1)
+    sorted_abs, _ = x.abs().sort(dim=-1)
+    thr = sorted_abs[..., idx : idx + 1]
+    y = torch.clamp(x, -thr, thr)
+    assert (y.abs() <= thr + 1e-6).all(), "越界值未被裁剪"
+    # 阈值 = 每向量第 idx 大 |x|（排序语义）
+    expect = x.abs().sort(dim=-1).values[..., idx]
+    assert torch.allclose(thr.squeeze(-1), expect, atol=1e-6)
+
+
+def t_should_oscar_rejects_mtp():
+    """MTP 草稿层拒绝（纯函数，无 vllm 依赖；草稿 KV 保持 BF16 走原生 SpecDecoding）。"""
+    import oscar_ascend.plugin as pl
+
+    class FakeLayer:
+        layer_name = "mtp.layers.0.self_attn.attn"
+
+    pl._SKIP_REASONS_LOGGED.clear()
+    assert pl._should_oscar(FakeLayer(), None) is False
+    assert pl._SKIP_REASONS_LOGGED == {"mtp-draft"}, pl._SKIP_REASONS_LOGGED
+
+
+def t_calib_cov_q_sst():
+    """校准统计：finalize_cov 输出 Σ_Q（qqt）与 Σ_S（sst，score-weighted）。"""
+    import oscar_ascend.calib as calib
+
+    torch.manual_seed(5)
+    q = torch.randn(64, 8, 32)
+    k = torch.randn(64, 2, 32)
+    v = torch.randn(64, 2, 32)
+    calib._captures = {
+        "language_model.model.layers.3.self_attn.attn": {"q": [q], "k": [k], "v": [v]}
+    }
+    st = calib.finalize_cov()["language_model.model.layers.3.self_attn.attn"]
+    assert set(st.keys()) == {"q", "v"}
+    cov_q, cov_v = st["q"]["cov"], st["v"]["cov"]
+    assert cov_q.shape == (32, 32) and (cov_q - cov_q.T).abs().max() < 1e-5
+    assert (cov_v - cov_v.T).abs().max() < 1e-5
+    plain_v = (v.reshape(-1, 32).T @ v.reshape(-1, 32)) / v.shape[0]
+    assert not torch.equal(cov_v, plain_v), "sst 权重未生效（Σ_S == Σ_V）"
+
+
 def main():
     print("== oscar_ascend CPU 数值镜像 ==")
     check("quantize/dequant ≤1e-5", t_quant_dequant)
@@ -320,6 +412,10 @@ def main():
     check("attn_type 值归一化(str-Enum)", t_attn_type_value_normalize)
     check("rotation 键容错(名称/int)", t_rotation_key_tolerance)
     check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
+    check("旋转组合 U@H@P 精度地板（旧 FAIL/新 PASS）", t_rotation_composition_quality_floor)
+    check("裁剪排序分位数语义", t_clip_sort_threshold)
+    check("MTP 草稿层拒绝（BF16 保真）", t_should_oscar_rejects_mtp)
+    check("校准 Σ_Q/Σ_S（qqt/sst）", t_calib_cov_q_sst)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0
 

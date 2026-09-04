@@ -6,3 +6,5 @@
 - 2026-09-03 20:57 | STEP R-GATES | record=plan/reflections/R-20260903-docker-device-type.md | -
 - 2026-09-03 20:57 | STEP R-EXIT | record=plan/reflections/R-20260903-docker-device-type.md | -
 - 2026-09-03 20:57 | EXIT OPEN | record=plan/reflections/R-20260903-docker-device-type.md | -
+- 2026-09-04 11:25 | ENTER 反思模式 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | trigger=真机 serve：OSCAR 激活后 MTP 接受率仅 9.5%~25%（正常 ~80%），疑似 INT2 KV 量化精度问题
+- 2026-09-04 11:36 | STEP Q1 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | Q1 定位：校准旋转=纯特征向量(无U@H@P组合)、目标错误(K用K^TK非Q^TQ/V用V^TV非sst)、clip=0、per-vector；量化噪声实验：当前配置 K/V relL2≈1.58(近噪声)，U@H@P+group16+clip 达0.10；另 MTP草稿层KV被INT2量化且SpecDecoding走prefill分支

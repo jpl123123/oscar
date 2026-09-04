@@ -134,14 +134,36 @@ bash delivery/check_oscar_active.sh --preflight || fail "预检未通过（见�
 # ---------- 阶段4 生成 pt（OSCAR 旋转检查点；校准默认 TP4 与 serve 一致） ----------
 ROT_DEFAULT="$REPO_ROOT/oscar_rotations.pt"
 if [ -z "${OSCAR_ASCEND_K_ROTATION_PATH:-}" ] && [ -z "${OSCAR_ASCEND_V_ROTATION_PATH:-}" ]; then
-    if [ "${OSCAR_ASCEND_GEN_ROTATIONS:-0}" == "1" ] || [ ! -e "$ROT_DEFAULT" ]; then
+    NEED_ROT=0
+    if [ -e "$ROT_DEFAULT" ]; then
+        # v2 配方检查：旧 pt（纯特征向量 U，无 U@H@P 组合）会导致 per-vector INT2 精度坍缩
+        # （见 tests/test_numeric.py::t_rotation_composition_quality_floor）→ 强制重新校准。
+        if $PYTHON -c '
+import sys, torch
+try:
+    obj = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+except Exception:
+    obj = None
+if isinstance(obj, dict) and obj.get("format_version", 0) >= 2 and "r_h_pbr" in str(obj.get("objective", "")):
+    sys.exit(0)
+sys.exit(1)
+' "$ROT_DEFAULT"; then
+            echo "复用旋转检查点: $ROT_DEFAULT（format_version>=2：U@H@P_br 组合配方）"
+        else
+            NEED_ROT=1
+            echo "⚠️ 现有 $ROT_DEFAULT 为旧配方（纯特征向量旋转，无 Hadamard/位反置换 + 旧 qqt 目标）"
+            echo "   —— 该配方在 per-vector INT2 下 ≈ 噪声（relL2≈1.57；U@H@P 后 ≈0.38），"
+            echo "   强制重新校准（OSCAR_ASCEND_GEN_ROTATIONS=1 等价）。"
+        fi
+    else
+        NEED_ROT=1
+    fi
+    if [ "${OSCAR_ASCEND_GEN_ROTATIONS:-0}" == "1" ] || [ "$NEED_ROT" == "1" ]; then
         step "生成 OSCAR 旋转检查点（离线校准，一次性；Docker 内执行）"
-        # 校准进程关闭插件（OSCAR_ASCEND_ENABLE=0）：BF16 原路径采集 K/V，避免与注入路径互扰
+        # 校准进程关闭插件（OSCAR_ASCEND_ENABLE=0）：BF16 原路径采集 Q/K/V，避免与注入路径互扰
         OSCAR_ASCEND_ENABLE=0 $PYTHON tools/gen_rotations.py --model "$MODEL_PATH" --save "$ROT_DEFAULT" \
             --max-len "${OSCAR_ASCEND_GEN_MAXLEN:-128}" \
             2>&1 | tee "$LOG_DIR/genrot_$STAMP.log" || fail "旋转检查点生成失败"
-    else
-        step "复用旋转检查点: $ROT_DEFAULT"
     fi
     export OSCAR_ASCEND_K_ROTATION_PATH="$ROT_DEFAULT"
     export OSCAR_ASCEND_V_ROTATION_PATH="$ROT_DEFAULT"
