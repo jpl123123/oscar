@@ -24,11 +24,49 @@ _HEARTBEAT: dict = {"loaded": 0, "layers": [], "errors": []}
 _PATCHED = False
 
 
+def _bootstrap_platform() -> None:
+    """进程级平台引导：强制 current_platform = NPUPlatform（vendor 自动激活失效）。
+
+    真机实测（2026-09-03 13:02，spawn 后）：父进程的手动强制激活**不迁移**到 spawn
+    worker；worker 内 vllm 重新解析平台又落回 UnspecifiedPlatform（device_type="" →
+    MemorySnapshot `assert device_fn is not None` 崩溃）。vllm general 插件在每个进程
+    （process0/engine-core/worker）都执行 → 在此统一引导。此时 vllm_ascend 平台栈已
+    由平台插件预热（日志 platform.py:62 先于本插件打印），import 安全。
+    """
+    try:
+        import vllm.platforms as vp
+
+        cur_type = getattr(vp.current_platform, "device_type", "")
+        if cur_type == "npu":
+            return
+        if cur_type not in ("", None):
+            # 非 Ascend 环境（cuda/rocm/cpu…）：不覆盖 —— 本插件只服务于 NPU 栈
+            print(f"[oscar-ascend] 平台引导跳过（current device_type={cur_type!r} 非 NPU）")
+            return
+        from vllm_ascend.platform import NPUPlatform
+
+        vp.current_platform = NPUPlatform()
+        print(
+            "[oscar-ascend] 平台引导: current_platform → NPUPlatform "
+            f"(device_type={vp.current_platform.device_type!r}, pid={os.getpid()})"
+        )
+    except Exception as e:  # pragma: no cover
+        print(
+            f"[oscar-ascend] ⚠️ 平台引导失败（当前进程可能仍为 UnspecifiedPlatform）: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
 def load_plugin() -> None:
-    """vllm.load_general_plugins() 调用（无参）。幂等 + fail-soft。"""
+    """vllm.load_general_plugins() 调用（无参）。幂等 + fail-soft。
+
+    ① 每个进程（含 spawn worker）先做**平台引导**（与注入开关无关）；
+    ② 注入（OSCAR impl 类外科手术）仅在 OSCAR_ASCEND_ENABLE != "0" 时安装。
+    """
     global _PATCHED
     if _PATCHED:
         return
+    _bootstrap_platform()
     if os.environ.get("OSCAR_ASCEND_ENABLE", "auto") == "0":
         print("[oscar-ascend] OSCAR_ASCEND_ENABLE=0 → 不注入（校准/诊断用原生路径）")
         _PATCHED = True

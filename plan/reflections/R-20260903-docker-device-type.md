@@ -114,3 +114,19 @@ reflect gate（本记录）→ 待跑
   literal ["fork","spawn"]）——gen_rotations 顶部 setdefault + install/serve 脚本默认导出。
 - 该崩溃与插件/算子无关；同因很可能会在 TP4 的 vllm serve 上复现，故一并写入 serve 默认。
 - 本记录保持 OPEN；退出条件：spawn 后校准成功 → probe → serve。
+
+
+## §9 后续进展（2026-09-03 13:02 真机日志四）—— spawn worker 平台未迁移
+
+- spawn 修复生效（EngineCore/worker 均不再有 ParallelOpenMP 崩溃），但 (Worker pid=1057)
+  `Current platform  does not have 'current_device' attribute.` +
+  `MemorySnapshot __post_init__ assert device_fn is not None`（mem_utils.py:88）。
+- 根因：父进程 `_force_ascend_platform()` 的强制激活**不迁移**到 spawn 子进程；子进程
+  重新解析平台又落回 UnspecifiedPlatform（device_type="" → 无 current_device）。
+- 修复：vllm general 插件在 process0/engine-core/worker 都会执行 → `load_plugin()` 首步
+  新增 `_bootstrap_platform()`：device_type 非 npu 且非空则跳过；为空则强制
+  `current_platform = NPUPlatform()`（带 pid 日志）；该引导与 OSCAR_ASCEND_ENABLE 无关
+  （enable=0 也引导，仅跳过算子注入）。此时 vllm_ascend 平台栈已由平台插件预热
+  （日志 platform.py:62 先于插件打印），import 安全；非 NPU 环境不覆盖。
+- 本记录保持 OPEN；退出条件：worker 平台引导日志 `平台引导: ... pid=<worker>` +
+  校准成功 → probe → serve。
