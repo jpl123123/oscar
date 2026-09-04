@@ -8,3 +8,16 @@
 - 2026-09-03 20:57 | EXIT OPEN | record=plan/reflections/R-20260903-docker-device-type.md | -
 - 2026-09-04 11:25 | ENTER 反思模式 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | trigger=真机 serve：OSCAR 激活后 MTP 接受率仅 9.5%~25%（正常 ~80%），疑似 INT2 KV 量化精度问题
 - 2026-09-04 11:36 | STEP Q1 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | Q1 定位：校准旋转=纯特征向量(无U@H@P组合)、目标错误(K用K^TK非Q^TQ/V用V^TV非sst)、clip=0、per-vector；量化噪声实验：当前配置 K/V relL2≈1.58(近噪声)，U@H@P+group16+clip 达0.10；另 MTP草稿层KV被INT2量化且SpecDecoding走prefill分支
+- 2026-09-04 11:43 | STEP Q2 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | Q2: GAP-SIGNATURE——沙盒只验字节/往返一致性（check_case k_error==0/rotation_error≤1e-4），无质量地板、无旋转配方契约、无 MTP/SpecDecoding 契约行（knowledge grep 0 命中）
+- 2026-09-04 11:43 | STEP Q3 | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | Q3: tests 新增 4 项——质量地板旧 FAIL(1.568)/新 PASS(0.377)双向、裁剪语义、MTP 拒绝、Σ_Q/Σ_S；install 阶段4 v2 配方自检强制重校准
+- 2026-09-04 11:43 | STEP R-SANDBOX | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | 复现=tests::t_rotation_composition_quality_floor（合成离群通道数据，语义推导，无真机数值）+ exp1/exp2 量化矩阵
+- 2026-09-04 11:43 | STEP R-FIX | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | 修复 6 文件逐行对应 Q1 表：gen_rotations(组合+format v2)/calib(qqt/sst)/plugin(mtp 拒绝)/backend(sort 裁剪)/serve_oscar(0.96/0.92+128)/install(v2 自检)+rotation 告警
+- 2026-09-04 11:43 | STEP R-GATES | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | workspace 16/16 PASS；bash -n×3；py_compile×5；E2E pipeline OK；skill reflect gate PASS(7 证据)/L3:store PASS/regression ALL GREEN
+- 2026-09-04 11:43 | EXIT RESOLVED | record=plan/reflections/R-20260904-oscar-int2-mtp-precision.md | 根因=旋转检查点非已验证配方(U·H·P_br 缺失+qqt/sst 目标错)+clip=0+per-vector+MTP 草稿 INT2(+sink<bs 静默失效)；已修复+提交 ed6340a push main；待真机复核（自动重校准+接受率回归）
+- 2026-09-04 13:01 | ENTER 反思模式 | record=plan/reflections/R-20260904-calib-capture-2d.md | trigger=真机校准失败：finalize_cov IndexError too many indices for tensor of dimension 2（4 worker 全挂；捕获 Q 为 2D [N,H*D]）
+- 2026-09-04 13:01 | STEP Q1 | record=plan/reflections/R-20260904-calib-capture-2d.md | 根因=钩子捕获 Attention.forward 入口 2D [N,H*D]（attention.py:483-488 内部才 view 3D）；ed6340a 的 finalize 3D 切片 → 全 worker IndexError；旧钩子只 reshape(-1,D) 未暴露
+- 2026-09-04 13:01 | STEP Q2 | record=plan/reflections/R-20260904-calib-capture-2d.md | GAP-FIXTURE：t_calib_cov_q_sst 绕过真实钩子手工喂 3D fixture，未覆盖 2D 入口契约
+- 2026-09-04 13:01 | STEP Q3 | record=plan/reflections/R-20260904-calib-capture-2d.md | t_calib_cov_q_sst 改为真实 FakeAttention+2D 调用；旧代码 IndexError FAIL / 新代码 PASS 双向；finalize 防御 3D 校验
+- 2026-09-04 13:01 | STEP R-FIX | record=plan/reflections/R-20260904-calib-capture-2d.md | calib 钩子 2D→3D 还原（模块头参数）+ mtp 跳过 + finalize 防御；tests 更新
+- 2026-09-04 13:01 | STEP R-GATES | record=plan/reflections/R-20260904-calib-capture-2d.md | py_compile OK；tests 16/16 PASS
+- 2026-09-04 13:01 | EXIT RESOLVED | record=plan/reflections/R-20260904-calib-capture-2d.md | 修复=钩子按模块头参数还原 3D+finalize 防御；真机复跑一键预期校准通过并产出 v2 pt

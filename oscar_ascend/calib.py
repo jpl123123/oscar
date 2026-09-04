@@ -37,6 +37,9 @@ def register_attention_hook(attn_module) -> None:
         return
     if ".linear_attn" in layer_name:
         return
+    if ".mtp." in layer_name or layer_name.startswith("mtp."):
+        # 与 plugin._should_oscar 一致：MTP 草稿层不量化（BF16 原生路径）→ 无需校准
+        return
     key = id(attn_module)
     if key in _REGISTERED_HOOK_IDS:
         return
@@ -44,20 +47,37 @@ def register_attention_hook(attn_module) -> None:
 
     def _hook(module, args, kwargs=None):
         # register_forward_pre_hook 回调签名 = (module, args[, kwargs])；
-        # Attention.forward(query, key, value, kv_cache, attn_metadata, output)
+        # Attention.forward(query, key, value, …)：**入口为 2D** [N, H*D]
+        # （vllm attention.py:483-488 才 view 成 3D —— 真机 03:43 崩溃教训），
+        # 在这里用模块头参数还原头视图（与 Attention.forward 内部 view 同语义）。
         if not args or len(args) < 3:
             return None
         q, k, v = args[0], args[1], args[2]
         if k is None or v is None or q is None:
+            return None
+        Hq = int(getattr(module, "num_heads", 0) or 0)
+        Hk = int(getattr(module, "num_kv_heads", 0) or 0)
+        D = int(getattr(module, "head_size", 0) or 0)
+        if Hq <= 0 or Hk <= 0 or D <= 0 or q.shape[-1] % (Hq * D) != 0:
+            print(f"[oscar-ascend][calib] ⚠️ 无法还原头视图（module attrs 缺失），跳过 {layer_name}")
             return None
         d = _captures.setdefault(layer_name, {"q": [], "k": [], "v": []})
         cur = sum(t.shape[0] for t in d["k"])
         if cur >= _TOKEN_CAP:
             return None
         take = min(k.shape[0], _TOKEN_CAP - cur)
-        d["q"].append(q[:take].detach().float())
-        d["k"].append(k[:take].detach().float())
-        d["v"].append(v[:take].detach().float())
+        d["q"].append(
+            q[:take].view(-1, Hq, D).detach().float() if q.dim() == 2
+            else q[:take].detach().float()
+        )
+        d["k"].append(
+            k[:take].view(-1, Hk, D).detach().float() if k.dim() == 2
+            else k[:take].detach().float()
+        )
+        d["v"].append(
+            v[:take].view(-1, Hk, D).detach().float() if v.dim() == 2
+            else v[:take].detach().float()
+        )
         return None
 
     attn_module.register_forward_pre_hook(_hook)
@@ -87,8 +107,15 @@ def finalize_cov(model=None) -> dict:
         q = torch.cat(d["q"], dim=0)
         k = torch.cat(d["k"], dim=0)
         v = torch.cat(d["v"], dim=0)
+        if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+            # 旧钩子/异常捕获可能仍是 2D（真机 03:43 IndexError 根因）——防御性跳过
+            print(f"[oscar-ascend][calib] ⚠️ {layer_name} 捕获非 3D（dim={q.dim()}/{k.dim()}/{v.dim()}），跳过")
+            continue
         n_hq = q.shape[1]
         n_hk = k.shape[1]
+        if n_hq % n_hk != 0 or n_hq < n_hk:
+            print(f"[oscar-ascend][calib] ⚠️ {layer_name} 头数异常 Hq={n_hq}/Hk={n_hk}，跳过")
+            continue
         g = n_hq // n_hk
         n = k.shape[0]
 

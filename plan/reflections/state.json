@@ -1,12 +1,17 @@
 {
-  "status": "ACTIVE",
-  "record": "plan/reflections/R-20260904-oscar-int2-mtp-precision.md",
-  "trigger": "真机 serve：OSCAR 激活后 MTP 接受率仅 9.5%~25%（正常 ~80%），疑似 INT2 KV 量化精度问题",
-  "phase": "Q1",
-  "started_at": "2026-09-04T11:25:05",
-  "updated_at": "2026-09-04T11:36:34",
-  "verdict": null,
+  "status": "RESOLVED",
+  "record": "plan/reflections/R-20260904-calib-capture-2d.md",
+  "trigger": "真机校准失败：finalize_cov IndexError too many indices for tensor of dimension 2（4 worker 全挂；捕获 Q 为 2D [N,H*D]）",
+  "phase": "R-GATES",
+  "started_at": "2026-09-04T13:01:13",
+  "updated_at": "2026-09-04T13:01:42",
+  "verdict": "RESOLVED",
   "notes": {
-    "Q1": "Q1 定位：校准旋转=纯特征向量(无U@H@P组合)、目标错误(K用K^TK非Q^TQ/V用V^TV非sst)、clip=0、per-vector；量化噪声实验：当前配置 K/V relL2≈1.58(近噪声)，U@H@P+group16+clip 达0.10；另 MTP草稿层KV被INT2量化且SpecDecoding走prefill分支"
-  }
+    "Q1": "根因=钩子捕获 Attention.forward 入口 2D [N,H*D]（attention.py:483-488 内部才 view 3D）；ed6340a 的 finalize 3D 切片 → 全 worker IndexError；旧钩子只 reshape(-1,D) 未暴露",
+    "Q2": "GAP-FIXTURE：t_calib_cov_q_sst 绕过真实钩子手工喂 3D fixture，未覆盖 2D 入口契约",
+    "Q3": "t_calib_cov_q_sst 改为真实 FakeAttention+2D 调用；旧代码 IndexError FAIL / 新代码 PASS 双向；finalize 防御 3D 校验",
+    "R-FIX": "calib 钩子 2D→3D 还原（模块头参数）+ mtp 跳过 + finalize 防御；tests 更新",
+    "R-GATES": "py_compile OK；tests 16/16 PASS"
+  },
+  "note": "修复=钩子按模块头参数还原 3D+finalize 防御；真机复跑一键预期校准通过并产出 v2 pt"
 }

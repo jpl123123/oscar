@@ -379,23 +379,54 @@ def t_should_oscar_rejects_mtp():
 
 
 def t_calib_cov_q_sst():
-    """校准统计：finalize_cov 输出 Σ_Q（qqt）与 Σ_S（sst，score-weighted）。"""
+    """校准统计（真机 03:43 IndexError 回归）：钩子在 **2D 入口** 还原头视图 →
+    finalize_cov 输出 Σ_Q（qqt）与 Σ_S（sst，score-weighted）。
+
+    vllm Attention.forward 入口为 [N, H*D] 二维（attention.py:483-488 才 view 3D）；
+    旧（误修）版本按 3D 切片 → 真机 4 worker IndexError。本测试用真实钩子路径。
+    """
     import oscar_ascend.calib as calib
 
     torch.manual_seed(5)
-    q = torch.randn(64, 8, 32)
-    k = torch.randn(64, 2, 32)
-    v = torch.randn(64, 2, 32)
-    calib._captures = {
-        "language_model.model.layers.3.self_attn.attn": {"q": [q], "k": [k], "v": [v]}
-    }
+    class FakeAttn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_name = "language_model.model.layers.3.self_attn.attn"
+            self.num_heads = 8
+            self.num_kv_heads = 2
+            self.head_size = 32
+
+        def forward(self, q, k, v, **kwargs):
+            return None
+
+    # 2D 入口形态（与 Attention.forward 一致）：[N, H*D]
+    q2d = torch.randn(64, 8 * 32)
+    k2d = torch.randn(64, 2 * 32)
+    v2d = torch.randn(64, 2 * 32)
+
+    mod = FakeAttn()
+    calib._REGISTERED_HOOK_IDS.clear()
+    calib.register_attention_hook(mod)
+    mod(q2d, k2d, v2d)   # 触发 forward_pre_hook（真实 2D→3D 还原路径）
+    assert len(calib._captures) == 1
+    cap = calib._captures["language_model.model.layers.3.self_attn.attn"]
+    assert cap["q"][0].shape == (64, 8, 32), f"Q 未还原头视图: {cap['q'][0].shape}"
+    assert cap["k"][0].shape == (64, 2, 32)
+    assert cap["v"][0].shape == (64, 2, 32)
+
     st = calib.finalize_cov()["language_model.model.layers.3.self_attn.attn"]
     assert set(st.keys()) == {"q", "v"}
     cov_q, cov_v = st["q"]["cov"], st["v"]["cov"]
     assert cov_q.shape == (32, 32) and (cov_q - cov_q.T).abs().max() < 1e-5
     assert (cov_v - cov_v.T).abs().max() < 1e-5
-    plain_v = (v.reshape(-1, 32).T @ v.reshape(-1, 32)) / v.shape[0]
+    plain_v = (cap["v"][0].reshape(-1, 32).T @ cap["v"][0].reshape(-1, 32)) / 64
     assert not torch.equal(cov_v, plain_v), "sst 权重未生效（Σ_S == Σ_V）"
+
+    # MTP 草稿层不应被捕获（与 plugin._should_oscar 同一策略）
+    mtp = FakeAttn()
+    mtp.layer_name = "mtp.layers.0.self_attn.attn"
+    calib.register_attention_hook(mtp)
+    assert len(calib._captures) == 1, "MTP 层不应进入校准捕获"
 
 
 def main():
