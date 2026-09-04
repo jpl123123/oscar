@@ -35,12 +35,13 @@ docker run -it --rm \
 
 ### 脚本流程（已按 Docker 预装环境裁剪）
 
-自检（版本 / NPU 可见性 / `HAS_TRITON` / 插件入口点）→ 安装插件（**`pip install
---no-deps --no-build-isolation -e .`，只装自身、不解析/升级预装依赖**；入口点已存在则自动跳过，
-`OSCAR_SKIP_INSTALL=1` 强制跳过）→ 指纹（HEAD/sha256/入口点）→ 生成旋转检查点
-`oscar_rotations.pt`（`tools/gen_rotations.py`，离线校准）→ 数值 probe（ref + triton 双模式，
-**任意 FAIL 拒绝 serve**）→ 以用户目标命令拉起 `vllm serve`（`delivery/serve_oscar.sh`，
-端口 8989，TP4，MTP3，262144 上下文，原命令逐项保留）。
+自检 → 安装插件（`--no-deps`，入口存在自动跳过）→ 指纹 → **启动前预检**
+（`check_oscar_active.sh --preflight`）→ 生成旋转检查点 → 数值 probe（ref+triton，FAIL 阻断）
+→ **后台拉起 serve → 自动等 `/health`（≤900s）→ 自动激活判定**
+（注入/★类外科手术/★配置生效三项必须；★写/读路径为"待请求"信息项——**脚本不代发请求**，
+由您随后跑 ais_bench 触发）→ ACTIVE 保持服务并打印结论；NOT-ACTIVE 自动停服并报错。
+诊断逃生门：`OSCAR_FOREGROUND_SERVE=1 bash delivery/install_and_launch.sh`（前台阻塞+tee）；
+现场保留：`OSCAR_KEEP_ON_FAIL=1`。
 
 变体：
 
