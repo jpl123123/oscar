@@ -27,7 +27,7 @@ if triton is not None:
         stride_kb, stride_kp, stride_kh,
         stride_vb, stride_vp, stride_vh,
         HEAD_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr, NUM_KV_HEADS: tl.constexpr,
-        DATA_BYTES: tl.constexpr, BLOCK_D: tl.constexpr,
+        DATA_BYTES: tl.constexpr, K_IDX_OFF: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         pos = tl.program_id(0)
         bh = tl.program_id(1)
@@ -96,7 +96,7 @@ def oscar_full_dequant_triton(
         k8.stride(0), k8.stride(1), k8.stride(2),
         v8.stride(0), v8.stride(1), v8.stride(2),
         HEAD_DIM=D, BLOCK_SIZE=bs, NUM_KV_HEADS=hk,
-        DATA_BYTES=D // VALUES_PER_BYTE, BLOCK_D=BLOCK_D,
+        DATA_BYTES=D // VALUES_PER_BYTE, K_IDX_OFF=K_IDX_OFF, BLOCK_D=BLOCK_D,
         num_warps=4, num_stages=1,
     )
     return k_buf[:cached_len], v_buf[:cached_len]

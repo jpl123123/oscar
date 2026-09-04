@@ -242,3 +242,15 @@ reflect gate（本记录）→ 待跑
   * 一键脚本 triton probe 默认**观察模式**（不阻断，`OSCAR_ASCEND_REQUIRE_TRITON=1`
     才硬门禁）；服务端 torch 路径未动。
 - 本记录保持 OPEN；退出条件：probe 全 PASS → serve 注入 OK → sampler 首轮。
+
+
+## §18 后续进展（2026-09-04 01:22-01:23 真机日志十二）—— torch 路径全绿，serve 启动
+
+- **probe ref 全 PASS**：store 字节差=0、dequant err K/V=0.0（≤1e-5）、decode err=0.0
+  （≤1e-4）→ `probe 全 PASS（mode=ref）—— 允许 serve`（torch 参考路径正式验收通过）。
+- triton probe（观察模式）编译错误：`NameError: Cannot access global variable K_IDX_OFF
+  from within @jit'ed function` → 修复：K_IDX_OFF 改为显式 `tl.constexpr` 形参
+  （store/decode/dequant 三内核同步修改）。
+- serve 启动失败：`serve_oscar.sh: line 41: OSCAR_EXTRA_ARGS: unbound variable`
+  （`set -u`）→ 修复 `${OSCAR_EXTRA_ARGS:-}`。
+- 本记录保持 OPEN；退出条件：serve 日志 [oscar-ascend] plugin 注入 OK + 首个请求采样。

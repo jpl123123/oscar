@@ -180,7 +180,7 @@ if triton is not None:
         stride_kb, stride_kp, stride_kh,
         stride_vb, stride_vp, stride_vh,
         D: tl.constexpr, H: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-        BLOCK_D: tl.constexpr, BLOCK_PACK: tl.constexpr,
+        BLOCK_D: tl.constexpr, BLOCK_PACK: tl.constexpr, K_IDX_OFF: tl.constexpr,
     ):
         pid = tl.program_id(0)
         token_idx = pid // H
@@ -251,5 +251,6 @@ def oscar_store_triton(
         v8.stride(0), v8.stride(1), v8.stride(2),
         D=D, H=H, BLOCK_SIZE=bs,
         BLOCK_D=triton.next_power_of_2(D), BLOCK_PACK=BLOCK_PACK,
+        K_IDX_OFF=K_IDX_OFF,
         num_warps=4, num_stages=1,
     )

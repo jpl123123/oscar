@@ -139,6 +139,7 @@ if triton is not None:
         NUM_KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_SIZE: tl.constexpr,
         NUM_KV_SPLITS: tl.constexpr, KV_GROUP_SIZE: tl.constexpr,
         DATA_BYTES: tl.constexpr, ATTN_SCALE: tl.constexpr,
+        K_IDX_OFF: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_KV: tl.constexpr,
     ):
         bid = tl.program_id(0)
@@ -286,6 +287,7 @@ if triton is not None:  # noqa: E305
             NUM_KV_HEADS=hk, HEAD_DIM=D, BLOCK_SIZE=bs,
             NUM_KV_SPLITS=NUM_SPLITS, KV_GROUP_SIZE=Hq // hk,
             DATA_BYTES=D // VALUES_PER_BYTE, ATTN_SCALE=scale,
+            K_IDX_OFF=K_IDX_OFF,
             BLOCK_D=BLOCK_D, BLOCK_KV=4,
             num_warps=1, num_stages=1,
         )
