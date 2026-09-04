@@ -42,7 +42,12 @@ def register_attention_hook(attn_module) -> None:
         return
     _REGISTERED_HOOK_IDS.add(key)
 
-    def _hook(module, q, k, v, kv_cache, attn_metadata, output):
+    def _hook(module, args, kwargs=None):
+        # register_forward_pre_hook 回调签名 = (module, args[, kwargs])；
+        # Attention.forward(query, key, value, kv_cache, attn_metadata, output)
+        if not args or len(args) < 3:
+            return None
+        k, v = args[1], args[2]
         if k is None or v is None:
             return None
         d = _captures.setdefault(layer_name, {"k": [], "v": []})

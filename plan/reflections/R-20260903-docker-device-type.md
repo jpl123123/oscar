@@ -192,3 +192,13 @@ reflect gate（本记录）→ 待跑
     max_tokens=4)`（引擎正常运行，forward context 就绪）→ `apply_model(finalize_cov)`
     → 跨 rank 合并 → eigh → 保存。
 - 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
+
+
+## §14 后续进展（2026-09-04 00:50 真机日志八）—— 钩子回调签名
+
+- 新失败：`TypeError: register_attention_hook.<locals>._hook() missing 5 required
+  positional arguments: 'k','v','kv_cache','attn_metadata','output'`（profile_run 首步触发）。
+- 根因：`register_forward_pre_hook` 回调签名 = `(module, args[, kwargs])`，
+  args 为位置参数元组；我按展开六个参数定义 → 参数缺失。
+- 修复：`_hook(module, args, kwargs=None)`，`k, v = args[1], args[2]`。
+- 本记录保持 OPEN；退出条件：saved oscar_rotations.pt → probe → serve。
