@@ -276,3 +276,18 @@ reflect gate（本记录）→ 待跑
 - 修复：probe_oscar / test_numeric 的理想 q 全部同步为 `floor(x+0.5)`；
   本地镜像 8/8 复验。
 - 本记录保持 OPEN；退出条件：probe 0/0/0 → serve 首请求。
+
+
+## §21 后续进展（2026-09-04 01:36 真机日志十五）—— triton 字节差 89 根因与本地建模
+
+- triton 观察模式字节差 9→4→**89**（预计算 scale 改动后恶化）；用户要求本地沙盒
+  建模先对齐再修。
+- **本地建模（tests/t_triton_store_model_bf16）复现**：bf16 输入下
+  `vector_scales` 未 `.float()` → bf16 上 amin/amax（8 位尾数）与 fp32 路径 scale
+  分歧（2.0 vs 1.9951）→ 全部 15 字节差均在 meta 区（0-7）；建模测试本地 FAIL。
+- 根因闭环：上一轮 guard 编辑因脚本 assert 中断未落盘（format.py 回退到未加 guard
+  版本）；本次正确落盘 guard（`vector_scales` 与 quantize 同源先 float()）。
+- 修复后本地建模：`triton store 路径建模(bf16) 字节差=0`；全套 9/9 PASS。
+- 沙盒建模覆盖策略（本轮起）：triton store 语义由本地镜像测试等价实现
+  （vector_scales + floor(x+0.5) + 打包 = format.make_slot_bytes 字节=0），
+  npu 端 cast/位运算差异由“精确值转换恒等”设计兜底 + probe 真机对照。

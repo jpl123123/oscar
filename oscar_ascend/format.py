@@ -55,6 +55,8 @@ def vector_scales(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     的 fp16 值"，再做 fp32→fp16 转换在任意舍入模式下均为恒等 → 字节必一致
     （torch-npu/triton-ascend 的 cast 舍入语义差异被消除）。
     """
+    if x.dtype != torch.float32:
+        x = x.float()
     vmin = x.amin(dim=-1, keepdim=True)
     vmax = x.amax(dim=-1, keepdim=True)
     scale = (vmax - vmin) / (LEVELS - 1)

@@ -182,6 +182,38 @@ def t_rotation_loader():
         assert torch.equal(get_layer_rotation("", "x", D, torch.device("cpu")), torch.eye(D))
 
 
+
+def t_triton_store_model_bf16():
+    """triton store 路径本地建模：bf16 输入 → vector_scales(fp32) + floor(x+0.5) +
+    打包 → 与 format.make_slot_bytes 字节差 == 0（拦截 min/max dtype 分歧类回归）。"""
+    from oscar_ascend.format import vector_scales
+
+    torch.manual_seed(7)
+    D, H, N = 32, 2, 6
+    k = torch.randn(N, H, D, dtype=torch.bfloat16) * 1.5
+    v = torch.randn(N, H, D, dtype=torch.bfloat16) * 1.5
+    ks, kz = vector_scales(k)
+    vs, vz = vector_scales(v)
+    qk = torch.clamp(torch.floor((k.float() - kz) / ks + 0.5), 0, 3)
+    qv = torch.clamp(torch.floor((v.float() - vz) / vs + 0.5), 0, 3)
+
+    def pack(q):
+        q4 = q.to(torch.int32).reshape(N, H, D // 4, 4)
+        return (q4[..., 0] | q4[..., 1] * 4 | q4[..., 2] * 16 | q4[..., 3] * 64).to(torch.uint8)
+
+    slot = torch.zeros(N, H, 160, dtype=torch.uint8)
+    db = D // 4
+    slot[..., 0:1] = fmt.f16_le(ks)[0]; slot[..., 1:2] = fmt.f16_le(ks)[1]
+    slot[..., 2:3] = fmt.f16_le(kz)[0]; slot[..., 3:4] = fmt.f16_le(kz)[1]
+    slot[..., 4:5] = fmt.f16_le(vs)[0]; slot[..., 5:6] = fmt.f16_le(vs)[1]
+    slot[..., 6:7] = fmt.f16_le(vz)[0]; slot[..., 7:8] = fmt.f16_le(vz)[1]
+    slot[..., 32 : 32 + db] = pack(qk)
+    slot[..., 96 : 96 + db] = pack(qv)
+    ref = fmt.make_slot_bytes(k.float(), v.float())
+    d = (slot != ref).sum().item()
+    assert d == 0, f"triton store 路径建模字节差 = {d}"
+
+
 def t_plugin_purity():
     """回归守卫：插件入口文件顶层禁止 vllm_ascend 导入（真机 Docker 循环导入教训）。"""
     import pathlib
@@ -201,6 +233,7 @@ def main():
     check("rotation invariance ≤1e-3", t_rotation_invariance)
     check("prefill continuation 形状/运行", t_prefill_ref)
     check("rotation 检查点加载/缺层回退", t_rotation_loader)
+    check("triton store 路径建模(bf16) 字节差=0", t_triton_store_model_bf16)
     check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0
