@@ -52,6 +52,25 @@ fi
 # 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 字面 --enforce-eager 防图捕获破坏。
 # 恢复 graph：手动删除下面一行的 --enforce-eager（不推荐，未验证）。
 
+# ---------- 方案 E（plan/DESIGN-20260904-E）：×2 packed 槽，默认开启 ----------
+# 机制：--kv-cache-dtype int8_per_token_head（合法字面量→torch.int8）使 patch_mamba_config
+# 页几何自动变为 256B/token·head × 1536 token/页；assert 256×1536==393216 成立；
+# 页字节 801,792B/三大条/16 池/GDN 全部不变 → FULL token 密度 ×2（真显存收益）。
+# OSCAR 槽内偏移（96/64B < 256B）零内核改动；MTP 草稿层由插件影子池保持 BF16
+# （OSCAR_ASCEND_PACKED=1 时自动启用，见 plugin.py / mtp_shadow.py）。
+# 回退：OSCAR_ASCEND_PACKED=0 bash delivery/serve_oscar.sh（同时回到 bf16 几何）。
+if [ "${OSCAR_ASCEND_PACKED:-1}" == "1" ]; then
+  export OSCAR_ASCEND_PACKED=1
+  PACKED_KV_DTYPE_ARGS="--kv-cache-dtype int8_per_token_head"
+  # 1536 的 mamba 对齐切分要求预算为其倍数：16384 不是（16384/1536=10.67）→ 用 15360=1536×10。
+  # （DESIGN-E §5.2 中"16128"为笔误：16128/1536=10.5 非整倍数。）
+  BATCHED_TOKENS="${OSCAR_ASCEND_BATCHED_TOKENS:-15360}"
+  echo "🧩 [oscar-ascend] packed×2 模式: kv-cache-dtype=int8_per_token_head, max-num-batched-tokens=$BATCHED_TOKENS（OSCAR_ASCEND_PACKED=0 可回退）"
+else
+  PACKED_KV_DTYPE_ARGS=""
+  BATCHED_TOKENS="${OSCAR_ASCEND_BATCHED_TOKENS:-16384}"
+fi
+
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "qwen3.5" \
     --host 0.0.0.0 \
@@ -59,7 +78,7 @@ exec vllm serve "$MODEL_PATH" \
     --data-parallel-size 1 \
     --tensor-parallel-size 4 \
     --max-model-len 262144 \
-    --max-num-batched-tokens 16384 \
+    --max-num-batched-tokens "$BATCHED_TOKENS" \
     --max-num-seqs 128 \
     --gpu-memory-utilization 0.9 \
     --compilation-config '{"cudagraph_capture_sizes":[1,4,8,12,16,24,32,48,56,64,72,84,96,108,112,128,160,172,196,200,212,232,272,288,312,328,344,360,384,400,416,432,448,480,512], "cudagraph_mode":"FULL_DECODE_ONLY"}' \
@@ -74,4 +93,5 @@ exec vllm serve "$MODEL_PATH" \
     --mamba-ssm-cache-dtype bfloat16 \
     --enforce-eager \
     --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
+    $PACKED_KV_DTYPE_ARGS \
     ${OSCAR_EXTRA_ARGS:-}

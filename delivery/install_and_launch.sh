@@ -182,16 +182,27 @@ REQUIRE_TRITON="${OSCAR_ASCEND_REQUIRE_TRITON:-1}"
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
     "$PYTHON" delivery/probe_oscar.py --mode ref \
         || fail "数值 probe(ref) FAIL —— 拒绝 serve"
+    "$PYTHON" delivery/probe_oscar.py --mode ref --slot-bytes 256 \
+        || fail "数值 probe(ref, packed 256B 槽) FAIL —— 拒绝 serve（DESIGN-E 几何）"
     if $PYTHON -c "from vllm.triton_utils import HAS_TRITON; import sys; sys.exit(0 if HAS_TRITON else 1)"; then
         if [ "$REQUIRE_TRITON" == "1" ]; then
             "$PYTHON" delivery/probe_oscar.py --mode triton \
                 || fail "数值 probe(triton) FAIL —— 拒绝 serve（默认硬门禁；降级逃生门：OSCAR_ASCEND_REQUIRE_TRITON=0）"
-            echo "  ✅ triton probe PASS → serve 将以 OSCAR_ASCEND_USE_TRITON=1 启动（serve_oscar.sh 默认）"
-        elif "$PYTHON" delivery/probe_oscar.py --mode triton; then
-            echo "  ✅ triton probe PASS（观察模式）→ USE_TRITON 保持默认 1"
+            "$PYTHON" delivery/probe_oscar.py --mode triton --slot-bytes 256 \
+                || fail "数值 probe(triton, packed 256B 槽) FAIL —— 拒绝 serve（DESIGN-E 几何）"
+            echo "  ✅ triton probe PASS（512B+256B 两档几何）→ serve 将以 OSCAR_ASCEND_USE_TRITON=1 启动（serve_oscar.sh 默认）"
         else
-            echo "  ⚠️ triton probe 未通过（观察模式）→ 强制 OSCAR_ASCEND_USE_TRITON=0（torch 参考路径）"
-            export OSCAR_ASCEND_USE_TRITON=0
+            if "$PYTHON" delivery/probe_oscar.py --mode triton; then
+                if "$PYTHON" delivery/probe_oscar.py --mode triton --slot-bytes 256; then
+                    echo "  ✅ triton probe PASS（512B+256B）→ USE_TRITON 保持默认 1"
+                else
+                    echo "  ⚠️ triton probe(packed 256B 槽) 未通过（观察模式）→ 强制 OSCAR_ASCEND_USE_TRITON=0"
+                    export OSCAR_ASCEND_USE_TRITON=0
+                fi
+            else
+                echo "  ⚠️ triton probe 未通过（观察模式）→ 强制 OSCAR_ASCEND_USE_TRITON=0（torch 参考路径）"
+                export OSCAR_ASCEND_USE_TRITON=0
+            fi
         fi
     else
         if [ "$REQUIRE_TRITON" == "1" ]; then

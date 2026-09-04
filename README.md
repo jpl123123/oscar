@@ -89,6 +89,8 @@ python3 tests/test_numeric.py    # CPU 镜像：store 字节差=0 / dequant≤1e
 | `OSCAR_ASCEND_SINK_TOKENS` / `RECENT_TOKENS` / `STAGING_TOKENS` | `128` / `256` / `8192` | BF16 Sink/Recent 窗口与 staging 容量（sink 必须 ≥ block_size=128 才产生实际页；64 会静默失效） |
 | `OSCAR_ASCEND_USE_TRITON` | `1`（serve 脚本默认） | `0`=torch 参考路径（降级/调试）。一键 probe PASS 后 serve 即走 Triton 内核（store 散写单核 / dequant fused） |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | `1`（一键脚本默认） | 阶段5 triton probe **硬门禁**（store 字节 + dequant/decode 数值对照，同 serve 的 Hk=1/Hq=8 特化）；`0`=观察模式：probe 失败自动降级 `USE_TRITON=0` 并告警，绝不带未验证内核进 serve |
+| `OSCAR_ASCEND_PACKED` | `1`（serve 脚本默认） | DESIGN-E ×2 packed 槽：自动追加 `--kv-cache-dtype int8_per_token_head`（页几何自动 256B/槽 ×1,536 token/页，页/三大条/GDN 不变，FULL 密度 ×2）+ MTP 草稿层 BF16 影子池（≈2.15GiB/rank，懒分配）。`0`=回退 legacy bf16 几何（无显存收益） |
+| `OSCAR_ASCEND_BATCHED_TOKENS` | packed=15360 / legacy=16384 | 必须为 block_size（1,536 / 768）的倍数，否则 mamba 对齐切分浪费每步预算（16384/1536=10.67 非整） |
 | `VLLM_ALLOW_INSECURE_SERIALIZATION` | `1`（脚本默认） | vendor vllm 跨进程 RPC 传函数需 pickle 回退（`collective_rpc`/`apply_model`；官方错误提示的指定出口） |
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn`（脚本默认） | 多进程 worker 启动方式；该 Docker 多线程父进程下 `fork` 会触发 PyTorch `ParallelOpenMP Invalid thread pool` 崩溃（12:58 实测） |
 

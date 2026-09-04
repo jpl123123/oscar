@@ -98,7 +98,32 @@ def load_plugin() -> None:
                 return None
             try:
                 impl = getattr(self, "impl", None)
-                if impl is None or not _should_oscar(self, impl):
+                if impl is None:
+                    return None
+                layer_name = getattr(self, "layer_name", "") or ""
+                # 方案 E（DESIGN-20260904-E 方案 A）：packed×2 几何（int8_per_token_head）
+                # 下 MTP 草稿层的原生路径无 per_token_head 算子 → 装 BF16 影子池 shim；
+                # PACKED=0（默认）保持原"排除"策略。shim 自带 dtype 守卫：若 kv_cache
+                # 仍为 bf16（忘传 dtype 参数）则透传原生，零行为变化。
+                if (
+                    os.environ.get("OSCAR_ASCEND_PACKED", "0") == "1"
+                    and (".mtp." in layer_name or layer_name.startswith("mtp."))
+                ):
+                    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl as _Impl
+
+                    if isinstance(impl, _Impl) and not impl.__class__.__name__.startswith(
+                        "AscendAttentionCP"
+                    ):
+                        from .mtp_shadow import MTPShadowAttentionImpl
+
+                        impl.__class__ = MTPShadowAttentionImpl
+                        print(
+                            f"[oscar-ascend] ★ MTP 影子池生效: {layer_name} "
+                            f"→ MTPShadowAttentionImpl（草稿 KV 保持 BF16，页外影子池，"
+                            f"DESIGN-E 方案 A；≈2.15GiB/rank，首请求懒分配）"
+                        )
+                        return None
+                if not _should_oscar(self, impl):
                     return None
                 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 

@@ -34,6 +34,14 @@
   镜像复现 max 4.11，out 恰差 L=Σexp(lse−M)≈2.05 倍）→ stage2 丢失 e_sum 归一化 +
   无空 split 守卫（未初始化 mid_o 垃圾读）→ 已对齐 vLLM `_fwd_kernel_stage2`
   （triton_decode_attention.py:549-613）修复，镜像复验 1.67e-06，待用户复跑。
+- 🚀 **同日三段（DESIGN-E 实施，MTP=方案A 影子池）**：packed×2 几何上线——serve_oscar.sh
+  默认 `OSCAR_ASCEND_PACKED=1`（追加 `--kv-cache-dtype int8_per_token_head` +
+  `--max-num-batched-tokens 15360`）→ 页几何自动 256B/槽×1536 token/页、P/三大条/16 池
+  不变、FULL 密度×2；插件：`mtp_shadow.py`（MTP 层 kv_cache→BF16 影子池 shim，≈2.15GiB/rank
+  懒分配，dtype 守卫防误启用）+ backend `_set_caches` 几何对账★（256/512 双档断言）+
+  probe `--slot-bytes 256` 档 + check [8] 项。**回退**：`OSCAR_ASCEND_PACKED=0`。
+  预期日志变化：`[SKIP] mtp-draft` 4 条 → `★ MTP 影子池生效` 4 条；KV usage 应约减半；
+  prefix hash 粒度 768→1536 变粗（接受率/命中需 ais_bench 复核）。
 
 ## 本轮已定位并修复的精度链（6 项，详见 R-20260904 记录）
 （……同上……）

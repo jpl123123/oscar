@@ -50,13 +50,16 @@ C_READ=$(grep -c "★ INT2 读路径(decode) 首次执行" "$LOG" || true)
 C_SKIP=$(grep -c "\[oscar-ascend\]\[SKIP\]" "$LOG" || true)
 C_NOEAGER=$(grep -c "enforce_eager=False" "$LOG" || true)
 C_TRITON=$(grep -c "★ OSCAR 配置生效.*triton=启用" "$LOG" || true)
+C_GEO=$(grep -c "★ 几何对账: K 槽 256B" "$LOG" || true)
+C_MTPSH=$(grep -c "★ MTP 影子池" "$LOG" || true)
 echo "  [1] plugin 注入 OK        : $C_INJECT 次（要求 ≥1）"
 echo "  [2] ★ 类外科手术生效      : $C_SURG 次（要求 ≥1；Qwen3.5 应为 16）"
 echo "  [3] ★ OSCAR 配置生效      : $C_CFG 次（要求 ≥1）"
 echo "  [4] ★ INT2 写路径首次执行 : $C_WRITE 次（信息项：首发请求后出现——您跑 ais_bench 后可见）"
 echo "  [5] ★ INT2 读路径(decode) : $C_READ 次（信息项：首发 decode 后出现）
   [6] enforce_eager=False 行 : $C_NOEAGER 次（警告项：OSCAR 仅 eager 验证；>0 说明未真正生效，见 serve_oscar.sh）
-  [7] triton 路径            : $C_TRITON 条 'triton=启用'（=0 → serve 全 torch 参考路径——检查阶段5 门禁/降级，见 install_and_launch.sh）"
+  [7] triton 路径            : $C_TRITON 条 'triton=启用'（=0 → serve 全 torch 参考路径——检查阶段5 门禁/降级，见 install_and_launch.sh）
+  [8] packed×2 几何/MTP 影子池: 几何对账 $C_GEO 条(256B 槽) / 影子池 $C_MTPSH 条（OSCAR_ASCEND_PACKED=1 时应 >0；=0 → legacy 几何或未启用，见 DESIGN-E）"
 [ "$C_SKIP" -gt 0 ] && echo "  ⚠️ 存在 [SKIP] 行（$C_SKIP 条）——请查看拒绝原因" || true
 
 OK=1

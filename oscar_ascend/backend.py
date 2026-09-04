@@ -151,6 +151,34 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         elif isinstance(kv_cache, torch.Tensor) and kv_cache.dim() > 0:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
         assert self.key_cache is not None and self.value_cache is not None
+        # 几何对账（DESIGN-20260904-E，每 impl 一次）：槽宽只允许
+        #   head_size（packed×2：int8 几何，512B/token·head，block_size=1536）或
+        #   2×head_size（legacy：bf16 几何，1024B/token·head，block_size=768）；
+        # 且槽内落位（K 96B / V 64B）不得越界。fork 漂移/参数漏传在此拦截。
+        if not getattr(self, "_oscar_geo_ok", False):
+            self._oscar_geo_ok = True
+            k8 = self.key_cache.view(torch.uint8)
+            v8 = self.value_cache.view(torch.uint8)
+            slot_k, slot_v = int(k8.stride(1)), int(v8.stride(1))
+            need_k = K_IDX_OFF + self.head_size // VALUES_PER_BYTE  # 32+64=96
+            need_v = self.head_size // VALUES_PER_BYTE  # 64
+            assert slot_k in (self.head_size, 2 * self.head_size), (
+                f"[oscar-ascend] 几何对账失败: k 槽宽 {slot_k}B（预期 "
+                f"{self.head_size}=packed×2 或 {2 * self.head_size}=legacy）"
+            )
+            assert need_k <= slot_k and need_v <= slot_v, (
+                f"[oscar-ascend] 槽容量不足: K 需 {need_k}B/V 需 {need_v}B "
+                f"vs 槽 {slot_k}/{slot_v}B（布局契约 N-01 越界）"
+            )
+            mode = (
+                "packed×2（int8 几何：512B/token·head，block_size=1536，FULL 密度×2）"
+                if slot_k == self.head_size
+                else "legacy（bf16 几何：1024B/token·head，block_size=768，无显存收益）"
+            )
+            print(
+                f"[oscar-ascend] ★ 几何对账: K 槽 {slot_k}B / V 槽 {slot_v}B → {mode}；"
+                f"槽内落位 K{need_k}B+V{need_v}B 无越界"
+            )
 
     def _layer_rots(self, layer: torch.nn.Module, device: torch.device):
         if not getattr(layer, "_oscar_rots", None):

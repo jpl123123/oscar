@@ -25,6 +25,9 @@ def main() -> int:
     ap.add_argument("--num-kv-heads", type=int, default=1)
     ap.add_argument("--num-heads", type=int, default=8)
     ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--slot-bytes", type=int, choices=[512, 256], default=512,
+                    help="512=legacy bf16 几何（1024B/token·head）；256=packed×2 int8 几何"
+                         "（DESIGN-E，512B/token·head）——内核偏移/stride 全自适应，两档都要过")
     ap.add_argument("--mode", choices=["ref", "triton"], default="ref")
     ap.add_argument("--num-tokens", type=int, default=3)
     args = ap.parse_args()
@@ -45,9 +48,15 @@ def main() -> int:
     N = args.num_tokens
     torch.manual_seed(0)
 
-    # 缓存视图：k/v 形状与真实 attn 层一致（kernel 粒度块 bs）
-    k_cache = torch.zeros(4, bs, Hk, D, dtype=torch.bfloat16, device=dev)
+    # 缓存视图：k/v 形状与真实 attn 层一致（kernel 粒度块 bs）。
+    # slot_bytes=512 → bf16 几何（k8.stride(1)=512）；256 → packed×2 int8 几何（stride=256）。
+    if args.slot_bytes == 256:
+        k_cache = torch.zeros(4, bs, Hk, D, dtype=torch.int8, device=dev)
+    else:
+        k_cache = torch.zeros(4, bs, Hk, D, dtype=torch.bfloat16, device=dev)
     v_cache = torch.zeros_like(k_cache)
+    print(f"  [几何] slot={args.slot_bytes}B/槽 → k8.stride(1)={k_cache.view(torch.uint8).stride(1)}B"
+          f"（{'packed×2' if args.slot_bytes == 256 else 'legacy'}）")
     k = torch.randn(N, Hk, D, device=dev, dtype=torch.bfloat16) * 1.5
     v = torch.randn(N, Hk, D, device=dev, dtype=torch.bfloat16) * 1.5
     slot_mapping = torch.arange(N, dtype=torch.int64, device=dev)

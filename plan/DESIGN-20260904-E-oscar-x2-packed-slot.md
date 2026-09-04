@@ -156,8 +156,8 @@ staging（staging 是页外 buffer，与池几何无关）。
    短前缀复用率下降。可接受性需真机 ais_bench 复核（`Prefix cache hit rate` 对比）。
 2. **chunked prefill 对齐粒度 1,536**：`max_num_batched_tokens=16,384` 不是 1,536 的
    倍数（16,384/1,536=10.67）→ mamba 对齐切分后每 step 实际调度 15,360 token
-   （-6.25% 预算利用率，[V] scheduler.py:293-338）。**建议同步把
-   `--max-num-batched-tokens` 改成 16,128 或 18,432**（1,536 的倍数）。
+   （-6.25% 预算利用率，[V] scheduler.py:293-338）。**实施已定为 15,360（=1,536×10；
+   初稿"16,128"为笔误——16,128/1,536=10.5 亦非整倍数；其他可选 16,896/18,432）**。
 3. **MTP 影子池固定 2.16GB/rank**：即使FULL 密度收益兑现，也要在 max-model-len
    262,144 的高水位下复核总显存（gpu-memory-utilization 0.9 已含 KV 预算重算）。
 4. `int8_per_token_head` 的 `kv_quant_mode` 位只被 FULL 层 spec 携带、无消费者
