@@ -321,3 +321,18 @@ reflect gate（本记录）→ 待跑
 - 附：本实例日志 `enforce_eager=False`（--enforce-eager 未生效，EAGER_ARGS 数组展开
   歧义）→ serve_oscar.sh 改字符串 EAGER 变量；check 新增 [6] 警告项（>0 提示未生效）。
 - 下一步：重启后应见 16× ★ 类外科手术 + 写/读路径；随后 ais_bench 验证。
+
+
+## §24 修复闭环（2026-09-04 02:43 真机日志十七）—— 手术已生效，pt 键 + eager
+
+- **手术首次真实生效**：栈进入 implementation.do_kv_cache_update →
+  rotation.get_layer_rotation（图捕获期）。
+- 崩溃：`ValueError: invalid literal for int() ... 'language_model.model.layers.11...'`
+  —— gen 落盘把**模块名**当键（上一轮只修了打印层号），rotation._load_checkpoint
+  `int(k)` 崩。
+- 修复：① gen 落盘键改 `str(lid)`；② rotation `_resolve_lid` 容错（int/数字串/模块名
+  正则）；③ 兼容旧 pt（模块名键经正则解析），无需强制重生成；单测 12/12。
+- 加：serve 命令**字面 `--enforce-eager`**（移除变量组合，杜绝展开歧义；
+  本次日志仍走 capture_model，说明旧实例未生效——本轮强制）。
+- 注意（自省记录）：期间一次补丁脚本把 rotation 内容误写入 gen（交叉写错文件），
+  已 `git checkout` 恢复后重打——教训：多文件同脚本修改必须文件级校验 diff。

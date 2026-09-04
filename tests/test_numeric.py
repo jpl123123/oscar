@@ -270,6 +270,32 @@ def t_attn_type_value_normalize():
     assert norm(PlainDecoder) is True
     assert norm(PlainNotDecoder) is False
 
+
+def t_rotation_key_tolerance():
+    """rotation._load_checkpoint 键容错：int / '11' / 模块名 均可解析。"""
+    import tempfile
+    from pathlib import Path as P
+
+    import oscar_ascend.rotation as rot
+
+    D = 16
+    R = torch.eye(D)
+    with tempfile.TemporaryDirectory() as td:
+        # 旧格式（v0 生成器误存模块名键）→ 需容错加载
+        p = P(td) / "name_keys.pt"
+        torch.save({"layers": {"language_model.model.layers.11.self_attn.attn":
+                               {"layer_id": 11, "rotation": R}}}, p)
+        tbl = rot._load_checkpoint(str(p))
+        assert 11 in tbl, "名称键应解析为 11"
+        assert torch.equal(tbl[11]["rotation"], R)
+        # 新格式（数字字符串键）
+        p2 = P(td) / "int_keys.pt"
+        torch.save({"layers": {"11": {"layer_id": 11, "rotation": R}}}, p2)
+        rot._load_checkpoint.cache_clear()
+        tbl2 = rot._load_checkpoint(str(p2))
+        assert 11 in tbl2
+        rot._load_checkpoint.cache_clear()
+
 def t_plugin_purity():
     """回归守卫：插件入口文件顶层禁止 vllm_ascend 导入（真机 Docker 循环导入教训）。"""
     import pathlib
@@ -292,6 +318,7 @@ def main():
     check("triton store 路径建模(bf16) 字节差=0", t_triton_store_model_bf16)
     check("hybrid 判定纯函数(含兜底)", t_hybrid_detection)
     check("attn_type 值归一化(str-Enum)", t_attn_type_value_normalize)
+    check("rotation 键容错(名称/int)", t_rotation_key_tolerance)
     check("插件顶层无 vllm_ascend 导入（回归守卫）", t_plugin_purity)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0

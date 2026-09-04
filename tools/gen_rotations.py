@@ -169,7 +169,7 @@ def main() -> int:
         lid = int(m.group(1))
         r_k, e_k = _rotation_from_stats(st["k"], D, dev)
         r_v, e_v = _rotation_from_stats(st["v"], D, dev)
-        layers_out[layer] = {
+        layers_out[str(lid)] = {   # 键 = 层号字符串（rotation._load_checkpoint 按 int/lid 索引）
             "layer_id": lid,
             "rotation": r_k,
             "rotation_v": r_v,

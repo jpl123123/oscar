@@ -39,10 +39,8 @@ if [ ! -f "$OSCAR_ASCEND_K_ROTATION_PATH" ]; then
 fi
 
 # R6 硬性：OSCAR impl 含运行时宿主控制流（.item()/.tolist()/逐层首写日志），
-# 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 默认 --enforce-eager 防图捕获破坏。
-# 想恢复 graph：OSCAR_EAGER=0（不推荐，未验证）。
-ENFORCE_EAGER="${OSCAR_EAGER:-1}"
-if [ "$ENFORCE_EAGER" == "1" ]; then EAGER="--enforce-eager"; else EAGER=""; fi
+# 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 字面 --enforce-eager 防图捕获破坏。
+# 恢复 graph：手动删除下面一行的 --enforce-eager（不推荐，未验证）。
 
 exec vllm serve "$MODEL_PATH" \
     --served-model-name "qwen3.5" \
@@ -64,5 +62,6 @@ exec vllm serve "$MODEL_PATH" \
     --additional-config '{"enable_cpu_binding":true}' \
     --mamba-cache-dtype bfloat16 \
     --mamba-ssm-cache-dtype bfloat16 \
+    --enforce-eager \
     --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
-    ${OSCAR_EXTRA_ARGS:-}
+    $OSCAR_EXTRA_ARGS

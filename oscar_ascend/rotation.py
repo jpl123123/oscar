@@ -25,12 +25,31 @@ def layer_index_from_name(layer_name: str) -> int | None:
 
 
 @lru_cache(maxsize=8)
+def _resolve_lid(key) -> int | None:
+    """检查点键容错：int / '11' / 'language_model.model.layers.11.self_attn.attn' 均可。"""
+    if isinstance(key, int):
+        return key
+    if isinstance(key, str):
+        try:
+            return int(key)
+        except ValueError:
+            m = _LAYER_IDX_RE.search(key)
+            if m:
+                return int(m.group(1))
+            ints = re.findall(r"\d+", key)
+            return int(ints[-1]) if ints else None
+    return None
+
+
+@lru_cache(maxsize=8)
 def _load_checkpoint(path: str) -> dict[int, dict[str, torch.Tensor]]:
     obj = torch.load(path, map_location="cpu", weights_only=False)
     out: dict[int, dict[str, torch.Tensor]] = {}
     if isinstance(obj, dict) and "layers" in obj:
         for k, entry in obj["layers"].items():
-            lid = int(k)
+            lid = _resolve_lid(k)
+            if lid is None:
+                continue
             if isinstance(entry, dict) and "rotation" in entry:
                 # gen_rotations / PR 格式：entry 含 rotation(+rotation_v/eigenvalues)
                 out[lid] = {
@@ -42,7 +61,10 @@ def _load_checkpoint(path: str) -> dict[int, dict[str, torch.Tensor]]:
                 out[lid] = {"rotation": entry.float().contiguous()}
     elif isinstance(obj, dict):
         for k, rot in obj.items():
-            out[int(k)] = (
+            lid = _resolve_lid(k)
+            if lid is None:
+                continue
+            out[lid] = (
                 {"rotation": rot.float().contiguous()}
                 if not (isinstance(rot, dict) and "rotation" in rot)
                 else {
