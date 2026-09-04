@@ -115,6 +115,22 @@ def main() -> int:
         equal = torch.equal(k2.view(torch.uint8), k_cache.view(torch.uint8)) and torch.equal(
             v2.view(torch.uint8), v_cache.view(torch.uint8)
         )
+        if not equal:
+            # 定位：报前 12 个差异 (slot, 槽内偏移, got, want)
+            import itertools
+
+            ka, kt = k2.view(torch.uint8), k_cache.view(torch.uint8)
+            diffs = []
+            for b, o, h in itertools.product(range(ka.shape[0]), range(bs), range(Hk)):
+                for off in range(160):
+                    if int(ka[b, o, h].view(-1)[off]) != int(kt[b, o, h].view(-1)[off]):
+                        diffs.append((int(b * bs + o), off, int(kt[b, o, h].view(-1)[off]),
+                                      int(ka[b, o, h].view(-1)[off])))
+                        if len(diffs) >= 12:
+                            break
+                if len(diffs) >= 12:
+                    break
+            print("  diff(槽idx, 槽内偏移B, triton, ref):", diffs)
         print(f"✅ triton vs ref 字节一致: {equal}")
         if not equal:
             return 1

@@ -48,6 +48,20 @@ def check_d(D: int) -> None:
 # ---------------------------------------------------------------------------
 # 量化 / 反量化（per-vector 非对称 INT2；N-02 舍入顺序）
 # ---------------------------------------------------------------------------
+def vector_scales(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """per-vector 的 scale/zero（**已 fp16 舍入**，N-02），fp32 视图返回。
+
+    单一来源：quantize 与 Triton 包装器共用；Triton 内核拿到的是"可精确表示
+    的 fp16 值"，再做 fp32→fp16 转换在任意舍入模式下均为恒等 → 字节必一致
+    （torch-npu/triton-ascend 的 cast 舍入语义差异被消除）。
+    """
+    vmin = x.amin(dim=-1, keepdim=True)
+    vmax = x.amax(dim=-1, keepdim=True)
+    scale = (vmax - vmin) / (LEVELS - 1)
+    scale = torch.where(scale > SCALE_FLOOR, scale, torch.full_like(scale, SCALE_FLOOR))
+    return scale.half().float(), vmin.half().float()
+
+
 def quantize(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -58,13 +72,8 @@ def quantize(
     """
     if x.dtype != torch.float32:
         x = x.float()
-    vmin = x.amin(dim=-1, keepdim=True)
-    vmax = x.amax(dim=-1, keepdim=True)
-    scale = (vmax - vmin) / (LEVELS - 1)
-    scale = torch.where(scale > SCALE_FLOOR, scale, torch.full_like(scale, SCALE_FLOOR))
     # N-02：先 fp16 舍入，再按舍入后的 scale/zero 量化（避免 0.5 边界 bin 翻转）
-    scale_f16 = scale.half().float()
-    zero_f16 = vmin.half().float()
+    scale_f16, zero_f16 = vector_scales(x)
 
     # N-02：q = clamp(floor((x-zero)/scale + 0.5), 0, 3) —— floor(+0.5)，与 Triton 内核、
     # sandbox 契约一致（torch.round 为银行家舍入，仅在 .5 边界差 1 电平 → triton 字节差）
@@ -172,6 +181,6 @@ __all__ = [
     "SLOT_SIZE", "K_META_OFF", "META_BYTES", "PAD_BYTES", "K_IDX_OFF", "V_IDX_OFF",
     "K_SLOT_BYTES", "V_SLOT_BYTES",
     "DEQUANT_TOL", "DECODE_TOL", "SCALE_FLOOR",
-    "check_d", "quantize", "dequant", "f16_le", "f16_be_from_le",
+    "check_d", "vector_scales", "quantize", "dequant", "f16_le", "f16_be_from_le",
     "make_slot_bytes", "parse_slot_bytes", "rotate",
 ]

@@ -149,32 +149,33 @@ def gather_kv_ref(
 
 # ---------------------------------------------------------------------------
 # Triton 内核（port PR#46774 triton_oscar_store.py，按本插件拆槽偏移；字节=ref）
+#
+# 字节一致性关键：scale/zero 由 torch 侧按契约预计算为**已 fp16 舍入**的精确值
+# （format.vector_scales），内核再做 fp32→fp16 转换（对可精确表示值任意舍入模式
+# 恒等）→ 消除 triton-ascend cast 舍入语义差异（真机 4 字节差根因）。
 # ---------------------------------------------------------------------------
 if triton is not None:
 
     @triton.jit
     def _quant_pack_vec(
         Src_ptr, base, d_offs, d_mask,
+        scale, zero,
         D: tl.constexpr, LEVELS: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
         vec = tl.load(Src_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
-        vmin = tl.min(tl.where(d_mask, vec, float("inf")), axis=0)
-        vmax = tl.max(tl.where(d_mask, vec, -float("inf")), axis=0)
-        scale = (vmax - vmin) / (LEVELS - 1)
-        scale = tl.where(scale > 1e-8, scale, 1e-8)
-        scale_f16 = scale.to(tl.float16)
-        zero_f16 = vmin.to(tl.float16)
-        scale = scale_f16.to(tl.float32)
-        zero = zero_f16.to(tl.float32)
-        q = tl.minimum(tl.maximum(((vec - zero) / scale + 0.5).to(tl.int32), 0), LEVELS - 1)
+        # N-02：q = clamp(floor((x - zero)/scale + 0.5), 0, LEVELS-1)
+        q = tl.minimum(
+            tl.maximum(((vec - zero) / scale + 0.5).to(tl.int32), 0), LEVELS - 1
+        )
         q_grp = tl.reshape(q, [BLOCK_D // 4, 4])
         shifts = tl.arange(0, 4) * 2
         packed = tl.sum((q_grp & 0x3) << shifts[None, :], axis=1).to(tl.uint8)
-        return packed, scale_f16, zero_f16
+        return packed
 
     @triton.jit
     def _oscar_store_kernel(
         Key_ptr, Value_ptr,       # [NH, D] fp32 已旋转（+裁剪）
+        KScale_ptr, KZero_ptr, VScale_ptr, VZero_ptr,   # [NH] fp32（已 fp16 舍入的精确值）
         KCache8_ptr, VCache8_ptr,
         Slot_mapping_ptr,         # [N]
         stride_kb, stride_kp, stride_kh,
@@ -188,6 +189,10 @@ if triton is not None:
         slot = tl.load(Slot_mapping_ptr + token_idx)
         if slot < 0:
             return
+        k_scale = tl.load(KScale_ptr + pid)
+        k_zero = tl.load(KZero_ptr + pid)
+        v_scale = tl.load(VScale_ptr + pid)
+        v_zero = tl.load(VZero_ptr + pid)
         blk = (slot // BLOCK_SIZE).to(tl.int64)
         off = (slot % BLOCK_SIZE).to(tl.int64)
         k_slot_base = (
@@ -202,23 +207,26 @@ if triton is not None:
         packed_offs = tl.arange(0, BLOCK_PACK)
         pack_mask = packed_offs < (D // 4)
 
-        k_packed, k_scale, k_zero = _quant_pack_vec(
-            Key_ptr, base, d_offs, d_mask, D=D, LEVELS=4, BLOCK_D=BLOCK_D
+        k_packed = _quant_pack_vec(
+            Key_ptr, base, d_offs, d_mask, k_scale, k_zero,
+            D=D, LEVELS=4, BLOCK_D=BLOCK_D,
         )
-        v_packed, v_scale, v_zero = _quant_pack_vec(
-            Value_ptr, base, d_offs, d_mask, D=D, LEVELS=4, BLOCK_D=BLOCK_D
+        v_packed = _quant_pack_vec(
+            Value_ptr, base, d_offs, d_mask, v_scale, v_zero,
+            D=D, LEVELS=4, BLOCK_D=BLOCK_D,
         )
         # K 槽 meta[0..7]：K scale/zero @0..3，V scale/zero @4..7（拼接后=N-01）
-        ks_u16 = k_scale.to(tl.uint16, bitcast=True)
-        kz_u16 = k_zero.to(tl.uint16, bitcast=True)
-        vs_u16 = v_scale.to(tl.uint16, bitcast=True)
-        vz_u16 = v_zero.to(tl.uint16, bitcast=True)
-        tl.store(KCache8_ptr + k_slot_base + 0, (ks_u16 & 0xFF).to(tl.uint8))
-        tl.store(KCache8_ptr + k_slot_base + 1, ((ks_u16 >> 8) & 0xFF).to(tl.uint8))
+        # 精确 fp16 值 → 任意舍入模式转换恒等
+        k_u16 = k_scale.to(tl.float16).to(tl.uint16, bitcast=True)
+        kz_u16 = k_zero.to(tl.float16).to(tl.uint16, bitcast=True)
+        v_u16 = v_scale.to(tl.float16).to(tl.uint16, bitcast=True)
+        vz_u16 = v_zero.to(tl.float16).to(tl.uint16, bitcast=True)
+        tl.store(KCache8_ptr + k_slot_base + 0, (k_u16 & 0xFF).to(tl.uint8))
+        tl.store(KCache8_ptr + k_slot_base + 1, ((k_u16 >> 8) & 0xFF).to(tl.uint8))
         tl.store(KCache8_ptr + k_slot_base + 2, (kz_u16 & 0xFF).to(tl.uint8))
         tl.store(KCache8_ptr + k_slot_base + 3, ((kz_u16 >> 8) & 0xFF).to(tl.uint8))
-        tl.store(KCache8_ptr + k_slot_base + 4, (vs_u16 & 0xFF).to(tl.uint8))
-        tl.store(KCache8_ptr + k_slot_base + 5, ((vs_u16 >> 8) & 0xFF).to(tl.uint8))
+        tl.store(KCache8_ptr + k_slot_base + 4, (v_u16 & 0xFF).to(tl.uint8))
+        tl.store(KCache8_ptr + k_slot_base + 5, ((v_u16 >> 8) & 0xFF).to(tl.uint8))
         tl.store(KCache8_ptr + k_slot_base + 6, (vz_u16 & 0xFF).to(tl.uint8))
         tl.store(KCache8_ptr + k_slot_base + 7, ((vz_u16 >> 8) & 0xFF).to(tl.uint8))
         # 索引区
@@ -245,8 +253,16 @@ def oscar_store_triton(
     BLOCK_PACK = triton.next_power_of_2(D // VALUES_PER_BYTE)
     k_flat = k_rot.reshape(N * H, D).contiguous().float()
     v_flat = v_rot.reshape(N * H, D).contiguous().float()
+    # 预计算已 fp16 舍入的 scale/zero（精确值 → 内核转换为恒等）
+    from ..format import vector_scales
+
+    ks, kz = vector_scales(k_rot.reshape(N, H, D))
+    vs, vz = vector_scales(v_rot.reshape(N, H, D))
     _oscar_store_kernel[(N * H,)](
-        k_flat, v_flat, k8, v8, slot_mapping,
+        k_flat, v_flat,
+        ks.reshape(-1).contiguous(), kz.reshape(-1).contiguous(),
+        vs.reshape(-1).contiguous(), vz.reshape(-1).contiguous(),
+        k8, v8, slot_mapping,
         k8.stride(0), k8.stride(1), k8.stride(2),
         v8.stride(0), v8.stride(1), v8.stride(2),
         D=D, H=H, BLOCK_SIZE=bs,
