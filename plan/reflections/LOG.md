@@ -28,3 +28,10 @@
 - 2026-09-04 13:14 | STEP R-FIX | record=plan/reflections/R-20260904-calib-device-dtype.md | calib 累加器 device=dev+fp32+末尾 .cpu()；删死代码；gen_rotations 父进程 CPU fp64 eigh（移除 NPU 尝试）
 - 2026-09-04 13:14 | STEP R-GATES | record=plan/reflections/R-20260904-calib-device-dtype.md | py_compile+bash -n OK；tests 16/16 PASS
 - 2026-09-04 13:14 | EXIT RESOLVED | record=plan/reflections/R-20260904-calib-device-dtype.md | 修复=设备绑定 fp32 累加+CPU fp64 特征分解；真机复跑一键预期校准通过产出 v2 pt
+- 2026-09-04 13:31 | ENTER 反思模式 | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | trigger=真机 serve 崩溃：backend.py:237 (seq_lens_cpu or seq_lens).tolist() → Boolean value of Tensor with more than one value is ambiguous（MTP 目标层 decode/续写走 _prefill_attention，seq_lens_cpu 为多元素 Tensor）
+- 2026-09-04 13:33 | STEP Q1 | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | 根因=_prefill_attention 的 (seq_lens_cpu or seq_lens)：seq_lens_cpu 为多元素 Tensor → bool() 抛 Boolean ambiguity；vllm-ascend AscendMetadata.seq_lens_cpu 恒为 Tensor（attention_v1.py:359）；MTP 目标层 decode 走此分支
+- 2026-09-04 13:33 | STEP Q2 | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | GAP-VERBATIM：t_prefill_ref 用手工 list fixture，从未构造 Tensor 型元数据字段；无元数据访问器测试
+- 2026-09-04 13:33 | STEP Q3 | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | t_prefill_metadata_accessor：旧 or 模式必错断言（双向）+ 三形态（Tensor/None 回退/裸 list）
+- 2026-09-04 13:33 | STEP R-FIX | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | backend.metadata_batch_lists 纯函数（is-not-None+tolist+_seq_lens_cpu 回退）；_prefill_attention 改用
+- 2026-09-04 13:33 | STEP R-GATES | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | py_compile OK；tests 17/17 PASS
+- 2026-09-04 13:33 | EXIT RESOLVED | record=plan/reflections/R-20260904-prefill-metadata-accessor.md | 同轮真机观测：接受率 42.6%~83.3%（修复前 9.5%~25%）——精度修复已生效；本崩溃为独立访问器缺陷，已修

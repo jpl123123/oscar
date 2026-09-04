@@ -439,6 +439,53 @@ def t_calib_cov_q_sst():
     assert len(calib._captures) == 1, "MTP 层不应进入校准捕获"
 
 
+def t_prefill_metadata_accessor():
+    """预填充元数据访问器（真机 05:21 崩溃回归）：禁止 `tensor or ...` 作布尔值。
+
+    旧写法 `(getattr(m, 'seq_lens_cpu', None) or m.seq_lens).tolist()` 在
+    seq_lens_cpu 为**多元素 Tensor** 时抛 Boolean ambiguity —— 双向证据：
+    旧表达式必然 RuntimeError；新 helper 返回 list。
+    """
+    from oscar_ascend.backend import metadata_batch_lists
+
+    # 双向证据 1：旧写法在多元素 Tensor 上必然抛错
+    try:
+        (torch.tensor([16384, 5]) or None)  # noqa: B015 —— 旧模式
+        assert False, "旧写法未抛错？torch 语义有变"
+    except RuntimeError as e:
+        assert "Boolean value of Tensor" in str(e)
+
+    class Meta:
+        pass
+
+    # 情况 A：seq_lens_cpu / query_start_loc_cpu 都是多元素 Tensor（真机崩溃场景）
+    m = Meta()
+    m.query_start_loc = torch.tensor([0, 16384, 16389], dtype=torch.int64)
+    m.query_start_loc_cpu = torch.tensor([0, 16384, 16389], dtype=torch.int64)
+    m.seq_lens = torch.tensor([16384, 5], dtype=torch.int64)
+    m.seq_lens_cpu = torch.tensor([16384, 5], dtype=torch.int64)
+    qsl, seqs = metadata_batch_lists(m)
+    assert qsl == [0, 16384, 16389] and seqs == [16384, 5]
+
+    # 情况 B：seq_lens_cpu 缺失（None）→ 回退设备 tensor
+    m2 = Meta()
+    m2.query_start_loc = torch.tensor([0, 3], dtype=torch.int64)
+    m2.query_start_loc_cpu = None
+    m2.seq_lens = torch.tensor([1000], dtype=torch.int64)
+    m2.seq_lens_cpu = None
+    qsl2, seqs2 = metadata_batch_lists(m2)
+    assert qsl2 == [0, 3] and seqs2 == [1000]
+
+    # 情况 C：常见元数据自身为 CPU numpy/list 形态
+    m3 = Meta()
+    m3.query_start_loc = [0, 5]
+    m3.query_start_loc_cpu = None
+    m3.seq_lens = [8]
+    m3.seq_lens_cpu = None
+    qsl3, seqs3 = metadata_batch_lists(m3)
+    assert qsl3 == [0, 5] and seqs3 == [8]
+
+
 def main():
     print("== oscar_ascend CPU 数值镜像 ==")
     check("quantize/dequant ≤1e-5", t_quant_dequant)
@@ -457,6 +504,7 @@ def main():
     check("裁剪排序分位数语义", t_clip_sort_threshold)
     check("MTP 草稿层拒绝（BF16 保真）", t_should_oscar_rejects_mtp)
     check("校准 Σ_Q/Σ_S（qqt/sst）", t_calib_cov_q_sst)
+    check("预填充元数据访问器（Tensor 禁止作布尔值）", t_prefill_metadata_accessor)
     print(f"== 结果: {len(PASS)} PASS / {len(FAIL)} FAIL ==")
     return 1 if FAIL else 0
 

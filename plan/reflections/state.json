@@ -1,17 +1,17 @@
 {
   "status": "RESOLVED",
-  "record": "plan/reflections/R-20260904-calib-device-dtype.md",
-  "trigger": "真机校准失败：calib.py:135 cov_q += qtq → RuntimeError Expected all tensors to be on the same device + ERR01002 OPS invalid type（4 worker 全挂）",
+  "record": "plan/reflections/R-20260904-prefill-metadata-accessor.md",
+  "trigger": "真机 serve 崩溃：backend.py:237 (seq_lens_cpu or seq_lens).tolist() → Boolean value of Tensor with more than one value is ambiguous（MTP 目标层 decode/续写走 _prefill_attention，seq_lens_cpu 为多元素 Tensor）",
   "phase": "R-GATES",
-  "started_at": "2026-09-04T13:12:04",
-  "updated_at": "2026-09-04T13:14:00",
+  "started_at": "2026-09-04T13:31:34",
+  "updated_at": "2026-09-04T13:33:19",
   "verdict": "RESOLVED",
   "notes": {
-    "Q1": "根因=累加器 torch.zeros(dtype=float64) 默认 CPU + 捕获张量在 NPU → cov_q+=qtq 设备混用；torch-npu 不支持 fp64（ERR01002 次因）；本地 CPU 测试全绿正好掩盖",
-    "Q2": "GAP-FIXTURE（附注：可提议新类 GAP-DEVICE）：本地运行时环境=CPU，默认设备恰等于数据设备、fp64 恰可用 → 设备/dtype 契约不可见",
-    "Q3": "t_calib 增 RPC 载荷 CPU/fp32 断言 + 源码守卫（禁 float64、必含 device=dev）；旧代码 FAIL/新代码 PASS",
-    "R-FIX": "calib 累加器 device=dev+fp32+末尾 .cpu()；删死代码；gen_rotations 父进程 CPU fp64 eigh（移除 NPU 尝试）",
-    "R-GATES": "py_compile+bash -n OK；tests 16/16 PASS"
+    "Q1": "根因=_prefill_attention 的 (seq_lens_cpu or seq_lens)：seq_lens_cpu 为多元素 Tensor → bool() 抛 Boolean ambiguity；vllm-ascend AscendMetadata.seq_lens_cpu 恒为 Tensor（attention_v1.py:359）；MTP 目标层 decode 走此分支",
+    "Q2": "GAP-VERBATIM：t_prefill_ref 用手工 list fixture，从未构造 Tensor 型元数据字段；无元数据访问器测试",
+    "Q3": "t_prefill_metadata_accessor：旧 or 模式必错断言（双向）+ 三形态（Tensor/None 回退/裸 list）",
+    "R-FIX": "backend.metadata_batch_lists 纯函数（is-not-None+tolist+_seq_lens_cpu 回退）；_prefill_attention 改用",
+    "R-GATES": "py_compile OK；tests 17/17 PASS"
   },
-  "note": "修复=设备绑定 fp32 累加+CPU fp64 特征分解；真机复跑一键预期校准通过产出 v2 pt"
+  "note": "同轮真机观测：接受率 42.6%~83.3%（修复前 9.5%~25%）——精度修复已生效；本崩溃为独立访问器缺陷，已修"
 }

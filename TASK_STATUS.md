@@ -30,6 +30,16 @@
 8. **校准依赖的设备/精度契约（真机 05:02 设备混用 + ERR01002）**：协方差累加器必须绑定
    捕获设备且用 fp32（torch-npu 不支持 float64）；gen_rotations 的 eigh/组合改父进程
    CPU fp64 固定执行（R-20260904-calib-device-dtype）。
+9. **serve 元数据访问器（真机 05:21 prefill 崩溃）**：`_prefill_attention` 旧写法
+   `(seq_lens_cpu or seq_lens)` 对多元素 Tensor 抛 Boolean ambiguity；抽出
+   `metadata_batch_lists()`（is-not-None + tolist + _seq_lens_cpu 回退）
+   （R-20260904-prefill-metadata-accessor）。
+
+> **📌 已确认的进度（05:20-05:21 真机数据）**：修复后的 serve 上 Avg Draft acceptance rate
+> 已达 **42.6%~83.3%**（修复前 9.5%~25%），Mean acceptance length 2.28~3.50（修复前 1.29~1.75），
+> 单位置 0.765~1.000/0.278~0.800/0.118~0.700 —— 精度修复已生效；05:21 崩溃（元数据访问器）
+> 已在 `9950764` 之后修复，待用户复跑一键 + ais_bench 复核完整接受率；若仍有差距，
+> 下一步 = **group16+bf16 量化**（语义证据：KL 1.7→0.09）。
 1. **旋转检查点非已验证配方**（最大杠杆）：旧 gen_rotations 只存特征向量 U（降序）；
    论文/PR 默认验证 = **R = U @ H @ P_br**（Hadamard + 位反置换，`compute_kv_rotation.py:234-265`）
    → 修复：`tools/gen_rotations.py` 移植组合，`format_version=2`。

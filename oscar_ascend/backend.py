@@ -15,6 +15,32 @@ from .kernels.decode_kernel import oscar_decode_ref, oscar_prefill_ref
 from .kernels.dequant_kernel import oscar_full_dequant, triton as _k_triton
 from .rotation import get_layer_rotation
 
+
+def metadata_batch_lists(attn_metadata) -> tuple[list, list]:
+    """提取 (query_start_loc, seq_lens) 的 host 列表——**禁止 Tensor 作布尔值**。
+
+    真机 2026-09-04 05:21 教训：`(seq_lens_cpu or seq_lens)` 在 seq_lens_cpu 为
+    **多元素 Tensor** 时抛 `Boolean value of Tensor with more than one value is
+    ambiguous`（MTP 目标层 decode 走 __prefill_attention__ 时元数据为 chunked-prefill 形）。
+    兼容：Tensor(任意设备，tolist 自动同步)、None 回退、_seq_lens_cpu、裸 list。
+    """
+
+    def _as_list(x, name: str) -> list:
+        if x is None:
+            raise RuntimeError(f"attn_metadata.{name} 缺失")
+        if hasattr(x, "tolist"):
+            return x.tolist()
+        return list(x)
+
+    q_sl = attn_metadata.query_start_loc
+    q_sl_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    qsl = _as_list(q_sl_cpu if q_sl_cpu is not None else q_sl, "query_start_loc")
+    seq_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+    if seq_cpu is None:
+        seq_cpu = getattr(attn_metadata, "_seq_lens_cpu", None)
+    seqs = _as_list(seq_cpu if seq_cpu is not None else attn_metadata.seq_lens, "seq_lens")
+    return qsl, seqs
+
 try:
     from vllm_ascend.attention.attention_v1 import (
         AscendAttentionBackendImpl,
@@ -227,15 +253,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
     def _prefill_attention(self, query, key, value, kv_cache, attn_metadata, layer) -> torch.Tensor:
         N, Hq, D = query.shape
         Hk = self.num_kv_heads
-        q_sl = attn_metadata.query_start_loc
-        qsl_list = (
-            attn_metadata.query_start_loc_cpu.tolist()
-            if getattr(attn_metadata, "query_start_loc_cpu", None) is not None
-            else q_sl.tolist()
-        )
-        seq_lens_list = (
-            (getattr(attn_metadata, "seq_lens_cpu", None) or attn_metadata.seq_lens).tolist()
-        )
+        qsl_list, seq_lens_list = metadata_batch_lists(attn_metadata)
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
         num_reqs = len(qsl_list) - 1
         for i in range(num_reqs):
