@@ -565,6 +565,26 @@ KV usage/并发与原生一模一样——即本文件 §0 说的"约等于无�
 | 每格 token 数 | 768 | **1,536** |
 
 
+**证据审计表**（图 v2 数字的三重验证）：
+
+| 图中数字 | 代码/日志出处 | 审计结果 |
+|---|---|---|
+| K 跨度 96B（8+24+64）、V 跨度 64B、逻辑槽 160B；**信息 72B+64B=136B**（24B 为垫） | format.py:19-33（K_IDX_OFF=32→32+64=96；V_IDX_OFF=96−96=64） | ✓ |
+| K 槽写 [+0..+8) 元数据（含 V 的 scale/zero @+4..+8）、[+32..+96) 编号；V 槽写 [+0..+64) | store_kernel.py:82-95（index_put_ 逐偏移） | ✓ |
+| 槽宽 512/256（= D×dtype 字节） | backend.py:164-172 几何对账断言 slot∈{256,512}；真机日志"★ 几何对账: K 槽 256B/V 槽 256B → packed×2" | ✓ |
+| 每格 768/1,536 token、格宽 393,216B 两算同值 | 768×512=1,536×256=393,216（复算）；真机影子池 shape 13,380=nb×12 → block_chunk=12 → block=1,536 | ✓ |
+| 写入率：跨度 37.5%（K 格）/25%（V 格）；信息 28.1%（K 格）；31.25%（token·head 跨度口径） | 147,456/393,216、98,304/393,216、110,592/393,216、160/512（复算） | ✓ |
+
+**三层 dtype 审查（池 / 视图 / OSCAR）**：池张量 dtype 在原生与 packed×2 是**同一行代码
+同一个 int8**（model_runner_v1.py:4124，与 `--kv-cache-dtype` 无关）；该参数喂两个独立
+消费者——① patch_mamba_config:53-56（只吃字节数 → 页几何 768/1,536 token/格），
+② attention.py:225→276→581 → model_runner:4628→4637（吃 torch dtype → `.view(bf16)`
+或 `.view(int8)` 切视图）。OSCAR 层无 dtype：store_kernel.py:61 `k_cache.view(torch.uint8)`
+仅是按字节寻址的再重解释，int2 是字节约定而非 torch 类型。命名陷阱：`int8_per_token_head`
+在 CUDA vllm 带量化内核语义，在 vllm-ascend 无任何消费者（grep 零命中）——只借"1 字节"
+属性当门把手。
+
+
 同一 token t=20,000 的寻址链（packed 版，设请求块表[13]=物理 7）：
 
 ```text
