@@ -42,6 +42,15 @@
   probe `--slot-bytes 256` 档 + check [8] 项。**回退**：`OSCAR_ASCEND_PACKED=0`。
   预期日志变化：`[SKIP] mtp-draft` 4 条 → `★ MTP 影子池生效` 4 条；KV usage 应约减半；
   prefix hash 粒度 768→1536 变粗（接受率/命中需 ais_bench 复核）。
+- 🚨 **真机 09-04 09:12（packed×2 首跑 32 并发）OOM 崩溃，已修**：崩点 =
+  `oscar_prefill_ref` 带整张 [N=15,360, C+N] bool 掩码 + fp32 物化的 SDPA（申请
+  206MiB 失败，28.35/29.49GiB 已满）。三因素：①旧版 fp32+整掩码+math scores 峰值
+  过大；②32 并发多请求临时量堆叠；③nb 掉到 1,115（影子池 shape 13,380=1,115×12
+  实证）——插件路径 profile 峰值被计入激活、KV 预算 -2GB。修复：prefill SDPA
+  改查询分块（QB=512，env `OSCAR_ASCEND_PREFILL_QBLOCK`）+ 跟随 bf16 + 每块小掩码
+  ——分块掩码语义经 numpy 镜像逐位验证（err=0.0）；临时峰值与 N 解耦，预期 nb 回升。
+  另：日志实证 ANALYSIS-C S1 预测——clip 的 ArgSort 索引跑 AiCpu（int64 不支持
+  AICore，warning 原文在案）。待用户复跑。
 
 ## 本轮已定位并修复的精度链（6 项，详见 R-20260904 记录）
 （……同上……）

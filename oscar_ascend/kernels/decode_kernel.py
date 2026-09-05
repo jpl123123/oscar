@@ -11,9 +11,13 @@ Triton（triton-ascend）：port PR #46774 `triton_oscar_decode.py` stage1/stage
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
+
+# prefill SDPA 的查询分块行数（真机 2026-09-04 09:12 OOM 修复，见 oscar_prefill_ref docstring）
+_PREFILL_QBLOCK = max(128, int(os.environ.get("OSCAR_ASCEND_PREFILL_QBLOCK", "512")))
 
 from ..format import (
     K_IDX_OFF,
@@ -73,25 +77,44 @@ def oscar_prefill_ref(
     hk: int,
     D: int,
 ) -> torch.Tensor:
-    """q 与 k/v 均为原空间调用方传入；缓存部分先由调用方逆旋转成原空间。"""
+    """q 与 k/v 均为原空间调用方传入；缓存部分先由调用方逆旋转成原空间。
+
+    真机 2026-09-04 09:12 OOM 教训（32 并发 chunked prefill，SDPA 申请 206MiB 失败，
+    28.35/29.49GiB 已占满）：旧版 ① 把 K/V/q 全升 fp32，② 一次性物化 [N, C+N]
+    整张 bool 掩码（N=15,360 时仅掩码就 ~253MiB，math 后端 scores 更大）。
+    修复：① 跟随 q 的 dtype（bf16，减半且免 fp32 拷贝）；② 查询按 QB 行分块，
+    掩码只建 [QB, C+N]，临时峰值与 N 解耦（块内语义与整块严格一致：
+    mask[i,j] = (C+q0+i) >= j）。QB 可用 OSCAR_ASCEND_PREFILL_QBLOCK 调（默认 512）。
+    """
     N, Hq = q_chunk.shape[0], q_chunk.shape[1]
     C = k_cached.shape[0]
     g = Hq // hk
-    k_full = torch.cat([k_cached, k_chunk], dim=0).float().transpose(0, 1).unsqueeze(0)
-    v_full = torch.cat([v_cached, v_chunk], dim=0).float().transpose(0, 1).unsqueeze(0)
-    q_t = q_chunk.float().transpose(0, 1).unsqueeze(0)
-    if C <= 0:
-        out = F.scaled_dot_product_attention(
+    QB = _PREFILL_QBLOCK
+    dt = q_chunk.dtype
+    dev = q_chunk.device
+    k_full = torch.cat([k_cached.to(dt), k_chunk.to(dt)], dim=0).transpose(0, 1).unsqueeze(0)
+    v_full = torch.cat([v_cached.to(dt), v_chunk.to(dt)], dim=0).transpose(0, 1).unsqueeze(0)
+    k_len = C + N
+    out = torch.empty(N, Hq, D, dtype=dt, device=dev)
+    if C <= 0 and N <= QB:
+        q_t = q_chunk.transpose(0, 1).unsqueeze(0)
+        o = F.scaled_dot_product_attention(
             q_t, k_full, v_full, is_causal=True, scale=scale, enable_gqa=(g > 1)
         )
-    else:
-        q_pos = torch.arange(N, device=q_chunk.device).unsqueeze(1) + C   # [N,1]
-        k_pos = torch.arange(C + N, device=q_chunk.device).unsqueeze(0)   # [1,C+N]
-        mask = k_pos <= q_pos
-        out = F.scaled_dot_product_attention(
+        out.copy_(o[0].transpose(0, 1))
+        return out
+    k_pos = torch.arange(k_len, device=dev)
+    for q0 in range(0, N, QB):
+        q1 = min(q0 + QB, N)
+        q_t = q_chunk[q0:q1].transpose(0, 1).unsqueeze(0)
+        # 块内因果：绝对位置 C+q0+i 的 query 可见 k_j（j ≤ C+q0+i）
+        q_pos = torch.arange(C + q0, C + q1, device=dev).unsqueeze(1)
+        mask = k_pos.unsqueeze(0) <= q_pos            # [q1-q0, k_len]，≤QB×k_len bool
+        o = F.scaled_dot_product_attention(
             q_t, k_full, v_full, attn_mask=mask, scale=scale, enable_gqa=(g > 1)
         )
-    return out[0].transpose(0, 1)[:, :Hq] if out.shape[1] != Hq else out[0].transpose(0, 1)
+        out[q0:q1] = o[0].transpose(0, 1)
+    return out
 
 
 def oscar_full_dequant_ref(
