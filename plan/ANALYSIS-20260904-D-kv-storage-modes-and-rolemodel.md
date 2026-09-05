@@ -289,7 +289,7 @@ nb = int( 16.36 × 2^30 ÷ 801,792 ÷ 16 ) = int(21,909.4) = 1,369
 | 组 | 每请求块数公式 | 32K 请求实例 | 依据 |
 |---|---|---|---|
 | FULL（16 层共用一份块表） | `cdiv(seq_len + lookahead 3, block_size)` | native **43** / packed **22** | [V] single_type_kv_cache_manager.py:276-277；lookahead [V] scheduler.py:462 |
-| GDN（3 组 × 16 层，align 模式） | 每组 `2 + num_spec(3) = 5` → 共 15 | **15**（不变） | [V] kv_cache_interface.py:627-636 |
+| GDN（3 组 × 16 层，align 模式） | 每组记账 `2 + num_spec(3) = 5` → 记账 15 / **驻留 12** | **15**（不变） | 记账：[V] kv_cache_interface.py:629-631；驻留：块表 = cdiv(num_tokens,768)+3 项，其中仅最后 `1+3=4` 个为真实块、其余为共享 null_block 占位（[V] single_type_kv_cache_manager.py:1142-1165）→ 3 组 × 4 = 12 |
 
 32K 请求的"账单"（nb=1,369）：native 占 **58 块号 = 4.24%**（有效字节 38.1MiB/池 ×
 16 池 ≈ 609MiB；记账占用 58×12.23MiB ≈ 709MiB，差值为死格）；packed 占 **37 块号
@@ -340,6 +340,50 @@ t=20,000
  → slot_mapping 值 = 42×128 + 32 = 5,408                               （[VA] block_table.py:210-229）
 （Hk=1：h 维度偏移 0；若 Hk>1 再加 h×512）
 ```
+
+**图一逐数字解说**（用户逐问的答案，全部有出处）：
+
+1. **"43×6" 的 6 怎么来的**：6 = `spec.block_size(768) ÷ kernel_block(128)`
+   ——[VA] model_runner_v1.py:4562 `block_size_chunk = current_kv_cache_spec.block_size
+   // block_size`。**分配器按 768 token/块记账，注意力内核按 128 token 翻页**，所以
+   一个物理块在块表里被展开成 6 个逻辑块（`logical = phys×6 + i`，block_table.py:
+   288-303）。K 视图第 0 维因此是 `1,369×6 = 8,214` 个逻辑块，43 个物理块 × 6 =
+   258 个逻辑块即本请求的 K 跨度。
+2. **128 是不是 NPU 片上 UB 的大小？——不能这么说**。128 是 Ascend 后端**声明**的
+   kernel block size（attention_v1.py:142-144 `get_supported_kernel_block_sizes() →
+   [128]`；硬编码处 patch_mamba_config.py:58），语义是"块表/slot_mapping 的分页
+   粒度"。aclnn 算子内部按多大 tile 进 UB 是 CANN 算子实现细节，不由该常数决定，
+   本文不对此下结论。768 则来自对齐等式（`attn_block_size = 128 × cdiv(393,216,
+   128×512) = 768`，patch_mamba_config.py:93-97）。
+3. **K 视图为什么是 (1,369×6, 128, 1, 256)**：区B 的 538,312,704B 稠密字节流按
+   "（逻辑块数, 每逻辑块 token 数, 每 rank KV 头数, 头维）"重新解释——128 是每逻辑
+   块 token 数、**1 是 Hk/rank**（模型共 4 个 KV 头，TP4 → 每卡 1 个，真机日志
+   `heads=1` 自证）、256 是 D、bf16 每元素 2B → 每逻辑块 128×1×256×2 = 65,536B。
+   代码：get_kv_cache_shape 返回 `(2, nb×6, 128, Hk, 256)`（model_runner:4563-4568 +
+   attention_v1.py:104-112），k_cache 取 shape[1:]（:4637）。
+4. **ssm 与 GDN 的关系；ssm 存什么**：GDN（Gated DeltaNet 线性注意力层）不存
+   per-token K/V，而是存一个**定尺寸**的循环状态——每层两份：
+   - **conv state (2560, 3) bf16 = 15,360B**（区A）：因果短卷积的最后 3 个抽头，
+     形状 = (conv_dim/TP4, conv_kernel−1)（[V] mamba_utils.py:218-226）；
+   - **ssm state (12, 128, 128) bf16 = 393,216B**（区B）：DeltaNet 的递推状态矩阵
+     S ∈ R^{Hv × d_v × d_k}，形状 = (num_v_heads/TP4 = 48/4 = 12, head_v=128,
+     head_k=128)（[V] mamba_utils.py:228-232 `temporal_state_shape =
+     (divide(num_v_heads, tp_world_size), head_v_dim, head_k_dim)`）。
+   线性注意力的全部历史被压缩进这一个固定矩阵 → **GDN 存储不随序列长度增长**
+   （与 FULL 的线性增长相对；这也是 chunked prefill 必须按块对齐的原因：状态只能在
+   整块边界 checkpoint）。
+5. **ssm 视图为什么是 (1,369, 12, 128, 128)**：同一区B 字节流换一把尺子——
+   `(块数 nb, 单块状态形状)`，每格 12×128×128×2B = 393,216B = **恰好 6 个连续
+   K 逻辑块**（6×65,536）——对齐等式 512×768==393,216 的存在目的。代码：
+   model_runner:4705-4713 `target_shape=(num_blocks, *shape)` 顺序稠密切片。
+   两视图同一字节；格子的身份（K 还是 ssm）由块号归属决定（§2.5.2）。
+6. **"我以为只存 GDN 三层的 state？"——对**：一个池住着 3 个 GDN 层（三个组各一
+   层）+ 1 个 FULL 层；每个 GDN 层存**自己的** conv+ssm 两份，占**自己领的块**。
+   15 的来源 = **记账公式**：每组 align 模式 `2 + num_spec(3) = 5` 块
+   （kv_cache_interface.py:629-631）× 3 组；**实际驻留**真实块 = 每组块表
+   cdiv(32,768,768)+3 = 46 项中仅最后 `1+3=4` 个真实块（其余 42 个为共享
+   null_block 占位，不占块号），3 组 × 4 = **12 个真实块/池**（single_type:
+   1142-1165）。图一按记账口径画 15（保守上界）。
 
 #### 2.5.5 图二：当前 OSCAR packed×2（int8, block=1,536）——同一请求，同一张卡
 
