@@ -112,6 +112,23 @@ int2 是字节约定。该参数喂两个独立消费者：patch_mamba_config:53
 几何）与视图 dtype；**不喂池**。命名陷阱：`int8_per_token_head` 的量化语义在
 vllm-ascend 无消费者（grep 零命中）——只借"1 字节"当门把手。
 
+**术语速查（block / page / 一切 size）**：
+
+| 术语 | 取值 | 图上对应 | 代码 |
+|---|---|---|---|
+| `block_size`（引擎说 "block" 默认指它；上游 vLLM 里 block=page 同义词） | 768/1,536 token | 主轴一格装的 token 数 | patch_mamba_config.py:93-103 |
+| kernel block size | 128 token（恒定） | 格内细格子（每格 6/12 个逻辑块） | attention_v1.py:142-144 |
+| page_size（页宽） | 801,792B | 三区各一格的字节和（记账单价） | kv_cache_interface.py:830 |
+| num_blocks（nb） | 1,369 | 主轴总格数 | kv_cache_utils.py:967 |
+
+关系四式：区B 格宽 = block_size×Hk×D×dtype字节 = 393,216（两种几何都必须成立，即对齐
+等式）；每格逻辑块数 = block_size÷128；请求 FULL 块数 = cdiv(seq, block_size)；
+页宽 = block_size×K+V 每 token 字节 + conv 15,360 = 801,792（常量——价格被 ssm 对齐
+钉死，block_size 是"393,216÷每 token K 字节"除出来的容量）。
+两级粒度是 vllm-ascend 混合特有（分配块 768/1,536 粗、内核 128 细，BlockTable 做
+phys×6/12+i 展开）；上游 block_size=kernel 块时两级合一。上游 vLLM 中 block 与 page
+是同义词（PagedAttention 的 OS 分页比喻），无包含关系。
+
 ### 2.3 容量：nb = 预算 ÷ 单价（910B4 算例）
 
 公式（[V] kv_cache_utils.py:967）：`nb = available_memory ÷ 801,792 ÷ 16`。
