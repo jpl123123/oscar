@@ -165,7 +165,11 @@ block_size÷128、请求 FULL 块数 = cdiv(seq, block_size)、页宽 = block_si
 token 字节 + conv 15,360 = 801,792。注意最后一式是**常量**：价格被 ssm 对齐钉死之后，
 block_size 就不再是自由参数，而是"393,216 ÷ 每 token K 字节"**除出来的容量**——每
 token 字节减半、容量自动翻倍，这就是 packed×2 零改动的全部原理。
-至于为什么会有 128 这第二级粒度：分配块（768/1,536）被 mamba 对齐钉得很粗，而 aclnn
+另注意两个意义勿混：**每格字节**——conv 15,360B 独小，ssm=K=V=393,216B 相等（相等是
+assert 设计出来的：K/V 来自 token 行数×每 token 字节，ssm 来自状态矩阵大小，来源独立，
+被对齐等式钉成相等）；**block_size（token 数）**——是块号的属性，不属于任何区：K/V 格
+装 block_size 个 token 的行，conv/ssm 格装一份状态快照（每跨 block_size 个 token
+checkpoint 一份）。至于为什么会有 128 这第二级粒度：分配块（768/1,536）被 mamba 对齐钉得很粗，而 aclnn
 内核要按 128 翻页——BlockTable 用 phys×6/12+i 做两级桥接，这是 vllm-ascend 混合特有
 的机制。上游 vLLM 没有这个问题，因为它的 block_size 与 kernel 块相等（如 CUDA 默认
 16），两级合一；且上游语境里 block 与 page 本就是同义词（PagedAttention 的 OS 分页
