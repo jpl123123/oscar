@@ -64,6 +64,16 @@ dtype=int8)`（[VA] model_runner_v1.py:4124）——选 int8 是因为每元素�
 是纯"字节容器"；它和 `--kv-cache-dtype` 的关系见本节末"三层 dtype"（那个参数改的是
 视图，改不到池）。
 
+**术语与连续性（从名字到地址的一条链）**：这根张量在 vLLM 里有三层名字——配置层
+`KVCacheTensor`（[V] kv_cache_interface.py:829-831，`size` 注释原文"**in bytes**"，
+外加 `shared_by` 层名表）→ 分配层 `kv_cache_raw_tensors`（[VA] :4130-4132 把
+`shared_by` 里 4 个层名映射到**同一个 tensor 对象**——"4 层合租"的代码形态）→
+使用层的 `k_cache`/`v_cache`/`state_tensors`（切出的视图）。连续性精确到两个层面：
+`torch.zeros` 单次分配 ⇒ **单根内部一个连续地址段**（C-contiguous）；但 16 根池是
+16 次独立分配，**彼此不保证相邻**（也无需）。后续所有 `.view()` 作用在连续切片上
+是零拷贝重解释（只改 dtype/shape 元数据、不搬字节）——probe 的
+`assert k8.is_contiguous()`（store_kernel.py:63）是这一性质在运行时的守护。
+
 **三稠密区（一根张量的真实字节序，非页内交织）**——GDN 从头顺序切（:4696-4714，官方
 注释 :4701-4704），FULL 在尾部切（:4574-4577）：
 
