@@ -36,6 +36,8 @@ python3 -m venv .venv
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
+完整评测约88分钟对比base约10分钟的当前代码分析、改进顺序与有条件的加速预期，见 [端到端慢速分析与改进计划](plan/audits/END_TO_END_SLOWNESS_AND_PLAN-20260908.md)。报告区分整集结果、单步诊断和工程预测。
+
 ## NPU 验证与启动
 
 容器需预装 vllm 0.23.0、vllm-ascend **0.23.1.dev0+g5cb98caaa.d20260822**、torch-npu、triton-ascend，并挂载模型和本仓库。该 Ascend 构建的 commit 标识对应本地 reference 的 v0.23.0 tag（5cb98caaa），不能仅凭包版本中的0.23.1拒绝它。提供的 reference HEAD 还附加了PR#12607 GDN补丁，仍需区分部署构建与参考树。安装器使用 --no-deps，保留容器预装框架。
