@@ -44,3 +44,13 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 用户03:24复测日志在 `_oscar_paged_stage1` 出现 `IR Dump After PlanMemory Failed (hivm-plan-memory)`，随后报告 `Ub overflow detected`；编译器关闭code-motion重试又报 `Failed to obtain op buffer shape size which should be static`。IR包含大量32×256临时张量以及reduce临时缓冲，直接把KV分块放大8倍没有解决临时数据占用问题。
 
 生产与微基准默认均恢复分块4；保留原生融合prefill、浮点稳定排序、长上下文门禁和计时工具。没有自动尝试16或吞掉编译失败，也没有关闭数值门禁。今后扩大分块需要先降低K/V临时张量的同时存活量并在目标编译器测定UB占用；不能根据循环数下降直接认定可用或提速。
+
+## 03:36–03:37复测：仍无明显服务收益，增加运行诊断
+
+新片段在Running=3/4、Waiting=27–29时生成吞吐仍只有0.1–0.9 tokens/s，MTP接受率100%。四个rank仍报告整数ArgSort回退AiCPU。日志没有实际attention路径或分段耗时，无法确认两项保留优化的耗时占比，也不能据此指认旧代码仍被加载。
+
+核对指定commit 5cb98caaa：`vllm_ascend/ops/gdn_attn_builder.py`中的 `_stable_argsort_for_npu` 把bool转成int32再稳定排序；混合spec/non-spec token元数据会调用它。这是当前警告的另一个明确候选来源。未改动GDN，也未把这条warning继续当作OSCAR staging的独占证据。
+
+新增默认关闭的 `OSCAR_ASCEND_PROFILE_STEPS`：对rank 0的前N个非空execute_model和后续sample_tokens采集同步墙钟时间、实际forward加载位置和已加载函数代码hash、OSCAR子阶段计数与耗时、PyTorch整数sort调用栈。正数显式开启；达到N后停止同步和算子追踪。嵌套阶段耗时重叠，冷调用包含编译，采集时吞吐会受到干扰。这次改动是取证工具，不宣称解决性能回归。
+
+55项本地pytest通过，包含关闭时不安装wrapper、真实CPU sort调用栈、保留结果/异常、清理诊断上下文、跳过空步骤和达到次数后停止采集。NPU同步及vendor调度接缝仍待用户环境验证。

@@ -69,6 +69,16 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
 
+服务仍慢时，先停旧服务，再采集一次有界诊断：
+
+```bash
+OSCAR_ASCEND_PROFILE_STEPS=6 bash delivery/install_and_launch.sh
+# 使用原有客户端发送同一批请求后，从另一终端提取诊断行
+grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
+```
+
+只计时rank 0前6个非空调度步骤及其采样，输出真实forward的加载路径/代码指纹、形状/开关、各OSCAR阶段耗时、整数sort调用栈。`inclusive_ms`包含嵌套阶段，不能相加；`wait_before_ms`记录进入该阶段前等待已提交设备任务的时间。同步和Python算子追踪会改变这几个步骤的吞吐，首轮也可能包含JIT，不能把诊断吞吐当作正式benchmark。默认关闭；达到步数后自动停止采集，不修改计算结果。
+
 ## 关键配置
 
 | 环境变量 | 默认/含义 |
@@ -79,6 +89,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
 | `OSCAR_ASCEND_USE_PAGED` | 插件默认0；一键paged门禁通过后设为1；每请求q_len≤16使用新内核 |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
+| `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | serve默认仓库内 `oscar_rotations.pt`；启动缓存初始化时检查目标层覆盖和正交性 |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | serve默认0.96/0.92；插件直接加载时默认0，范围[0,1] |

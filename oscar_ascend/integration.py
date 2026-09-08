@@ -189,4 +189,7 @@ def install_runner_hooks():
 
     NPUWorker.determine_available_memory = determine_available_memory
     NPUModelRunner.initialize_kv_cache_tensors = initialize_kv_cache_tensors
+    from .diagnostics import install_diagnostics
+
+    install_diagnostics(NPUModelRunner)
     NPUWorker._oscar_memory_hook = True
