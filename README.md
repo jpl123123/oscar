@@ -1,4 +1,6 @@
-# oscar-ascend — OSCAR INT2 KV cache for vllm-ascend 0.23.0
+# oscar-ascend — OSCAR INT2 KV cache for Ascend
+
+目标运行环境：**vllm 0.23.0 + vllm-ascend 0.23.1.dev0+g5cb98caaa.d20260822**（用户指定镜像版本）。
 
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
@@ -33,7 +35,7 @@ python3 -m venv .venv
 
 ## NPU 验证与启动
 
-容器需预装 vllm/vllm-ascend 0.23.0、torch-npu、triton-ascend，并挂载模型和本仓库。提供的 Ascend reference 是0.23.0加PR#12607 GDN补丁；部署镜像需明确记录对应版本，不能将它与纯发布版混同。
+容器需预装 vllm 0.23.0、vllm-ascend **0.23.1.dev0+g5cb98caaa.d20260822**、torch-npu、triton-ascend，并挂载模型和本仓库。该 Ascend 构建的 commit 标识对应本地 reference 的 v0.23.0 tag（5cb98caaa），不能仅凭包版本中的0.23.1拒绝它。提供的 reference HEAD 还附加了PR#12607 GDN补丁，仍需区分部署构建与参考树。安装器使用 --no-deps，保留容器预装框架。
 
 ```bash
 # 在仓库根目录安装本次代码；不更新容器的框架依赖

@@ -52,10 +52,9 @@ step() { echo "==> [oscar-ascend] $1"; }
 step "自检: vllm/vllm-ascend/triton/NPU 可见性/插件入口点"
 $PYTHON - <<'PY' > "$LOG_DIR/selfcheck_$STAMP.log" 2>&1 || { cat "$LOG_DIR/selfcheck_$STAMP.log"; fail "自检失败（Python 环境异常）"; }
 import importlib.metadata as md, os, sys
-from packaging.version import Version
+from delivery.runtime_versions import check_runtime_version
 for package in ("vllm", "vllm-ascend"):
-    version = Version(md.version(package))
-    assert version.base_version == "0.23.0", f"Unsupported {package} version: {version}; expected 0.23.0"
+    check_runtime_version(package, md.version(package))
 print("  CWD:", os.getcwd())
 for name in ("vllm", "vllm-ascend", "triton", "torch", "torch-npu", "torch_npu"):
     try:
