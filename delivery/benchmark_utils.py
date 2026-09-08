@@ -7,7 +7,13 @@ import torch
 
 
 def compare_calls(
-    calls, sync, repeats=6, *, clock=time.perf_counter, label="PREP BENCH"
+    calls,
+    sync,
+    repeats=6,
+    *,
+    clock=time.perf_counter,
+    label="PREP BENCH",
+    progress=False,
 ):
     if repeats < 2:
         raise ValueError("A/B timing requires at least two rounds")
@@ -26,6 +32,12 @@ def compare_calls(
     for name, fn in calls.items():
         print(f"{label} first call: {name}", flush=True)
         value, first[name] = measure(fn)
+        if progress:
+            print(
+                f"{label} first call complete: {name} {first[name]:.3f} ms "
+                "(includes first-use work; excluded from warm median)",
+                flush=True,
+            )
         # Outputs may share the same destination buffer across variants.
         outputs[name] = value.detach().float().cpu().clone()
     for name in names[1:]:
@@ -34,8 +46,19 @@ def compare_calls(
         )
     for round_id in range(repeats):
         for name in names if round_id % 2 == 0 else names[::-1]:
+            if progress:
+                print(
+                    f"{label} warm sample {round_id + 1}/{repeats}: {name} start",
+                    flush=True,
+                )
             _, elapsed = measure(calls[name])
             samples[name].append(elapsed)
+            if progress:
+                print(
+                    f"{label} warm sample {round_id + 1}/{repeats}: "
+                    f"{name} complete {elapsed:.3f} ms",
+                    flush=True,
+                )
     return {
         name: {
             "first_call_ms": first[name],

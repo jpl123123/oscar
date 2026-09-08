@@ -43,3 +43,31 @@ def test_comparison_copies_shared_output_before_next_variant():
             lambda: None,
             repeats=2,
         )
+
+
+def test_progress_printing_is_outside_timing(monkeypatch):
+    now, lines = [0.0], []
+
+    def slow_print(message, **kwargs):
+        lines.append(message)
+        now[0] += 10.0
+
+    def call():
+        now[0] += 0.002
+        return torch.ones(3)
+
+    monkeypatch.setattr("builtins.print", slow_print)
+    result = compare_calls(
+        {"baseline": call, "streaming": call},
+        lambda: None,
+        repeats=2,
+        clock=lambda: now[0],
+        label="STREAM BENCH",
+        progress=True,
+    )
+    for timing in result.values():
+        assert timing["first_call_ms"] == pytest.approx(2)
+        assert timing["median_ms"] == pytest.approx(2)
+    assert any("first call complete: streaming" in line for line in lines)
+    assert any("warm sample 2/2: streaming start" in line for line in lines)
+    assert any("warm sample 2/2: streaming complete" in line for line in lines)

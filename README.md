@@ -5,7 +5,7 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。目标BF16 query + 128-token kernel页已在NPU通过16个内核case；真实backend及性能门禁仍需完整通过。**
+**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。目标BF16 query + 128-token kernel页已通过NPU数值和backend检查，但性能门禁失败：1/8请求MTP分别慢约2.11/2.21倍，长continuation约30.47秒/层，比旧OSCAR native对照慢约1000倍。此版本尚不能作为性能修复交付，一键入口会阻断服务。**
 
 当前NPU streaming部署限定BF16模型/query和`cache.shape[1]=128`。这不改变INT2的int8物理槽，也不改变分配器外层可能为1536的block布局。FP16 query、1536-token kernel页及两者组合属于独立兼容测试；组合配置曾触发编译器静态buffer形状错误，尚未修复。worker初始化和forward会拒绝未验证配置，避免把测试拆分误当作扩大支持范围。
 
@@ -57,7 +57,7 @@ python3 delivery/probe_streaming.py --device npu
 bash delivery/install_and_launch.sh
 ```
 
-一键默认`OSCAR_ASCEND_ATTENTION_MODE=streaming`。先跑数值和生命周期门禁，再在同一输入上比较单请求24K MTP、8请求24K MTP及15360+9256 continuation。任何形状的预热中位耗时若比native对照高超过10%，会停止启动并留下`streaming_bench_*.log`；不会静默回退完整历史物化。此门槛只是防止明显回退，不能替代完整LongBench/吞吐验收。
+一键默认`OSCAR_ASCEND_ATTENTION_MODE=streaming`。先跑数值和生命周期门禁，再在同一输入上比较单请求24K MTP、8请求24K MTP及15360+9256 continuation。任何形状的预热中位耗时若比native对照高超过10%，会立即停止、跳过剩余性能用例并留下`streaming_bench_*.log`；不会静默回退完整历史物化。只有全部形状通过才允许继续启动。此门槛只是防止明显回退，不能替代完整LongBench/吞吐验收。
 显式`OSCAR_ASCEND_ATTENTION_MODE=native`保留上一版对照。直接运行`serve_oscar.sh`也默认streaming，但不执行前置门禁，正式复测应使用一键入口。
 
 服务默认：模型 `/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp`、TP4、NPU 0–3、端口8989、MTP草稿3 tokens、eager。可用 `MODEL_PATH`、`ASCEND_RT_VISIBLE_DEVICES` 和 `OSCAR_EXTRA_ARGS` 调整。
@@ -75,7 +75,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
 
-停服务后运行`./bench`，现在比较native完整历史对照和新的streaming路径，包括1/8请求MTP及continuation。输出`STREAM BENCH`中的首次调用、6次交错采样、中位数和`baseline_over_streaming`；>1表示新路径更快。暂存字节是计算量，不是设备峰值。旧KV准备融合的A/B工具仍在`tools/benchmark_prep.py`。工具不启动服务、不切换默认值。
+停服务后运行`./bench`，现在比较native完整历史对照和新的streaming路径，包括1/8请求MTP及continuation。输出`STREAM BENCH`中的首次调用、6次交错采样、中位数和`baseline_over_streaming`；>1表示新路径更快。每次预热采样开始和完成都会打印，日志不再只停留在首次调用。独立`./bench`仍收集全部用例；`./bench --gate`则在首个性能失败后停止，当前版本建议用后者避免重复等待长continuation。暂存字节是计算量，不是设备峰值。旧KV准备融合的A/B工具仍在`tools/benchmark_prep.py`。工具不启动服务、不切换默认值。
 
 服务仍慢时，先停旧服务，再采集一次有界诊断：
 
