@@ -11,5 +11,5 @@
 from . import format, config, rotation  # noqa: F401
 from .kernels import HAS_TRITON  # noqa: F401
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["format", "config", "rotation", "HAS_TRITON", "__version__"]

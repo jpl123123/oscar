@@ -32,13 +32,20 @@ def metadata_batch_lists(attn_metadata) -> tuple[list, list]:
             return x.tolist()
         return list(x)
 
-    q_sl = attn_metadata.query_start_loc
     q_sl_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
-    qsl = _as_list(q_sl_cpu if q_sl_cpu is not None else q_sl, "query_start_loc")
+    ends = getattr(attn_metadata, "actual_seq_lengths_q", None)
+    if q_sl_cpu is not None:
+        qsl = _as_list(q_sl_cpu, "query_start_loc_cpu")
+    elif ends is not None:
+        qsl = [0] + _as_list(ends, "actual_seq_lengths_q")
+    else:
+        qsl = _as_list(attn_metadata.query_start_loc, "query_start_loc")
     seq_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
     if seq_cpu is None:
         seq_cpu = getattr(attn_metadata, "_seq_lens_cpu", None)
-    seqs = _as_list(seq_cpu if seq_cpu is not None else attn_metadata.seq_lens, "seq_lens")
+    seq_list = getattr(attn_metadata, "seq_lens_list", None)
+    seqs = _as_list(seq_list if seq_list is not None else (
+        seq_cpu if seq_cpu is not None else attn_metadata.seq_lens), "seq_lens")
     return qsl, seqs
 
 try:
@@ -58,10 +65,11 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
     def _oscar_setup(self) -> None:
         if getattr(self, "_oscar_cfg", None) is not None:
             return
-        self._oscar_cfg: OscarAscendConfig = OscarAscendConfig.from_env(
-            head_dim=self.head_size
-        )
-        check_d(self._oscar_cfg.head_dim)
+        cfg = OscarAscendConfig.from_env(head_dim=self.head_size)
+        check_d(cfg.head_dim)
+        if self.num_heads % self.num_kv_heads:
+            raise ValueError("OSCAR requires Hq divisible by Hk")
+        self._oscar_cfg = cfg
         self._oscar_rot_ready = False
         self._oscar_stage_ready = False
         self._oscar_warned_quantile = False
@@ -113,6 +121,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         kv_cache,
         slot_mapping: torch.Tensor,
     ) -> None:
+        slot_mapping = slot_mapping.to(device=key.device, dtype=torch.int64) if key is not None else slot_mapping
         N = slot_mapping.shape[0]
         if N <= 0 or key is None or value is None:
             return
@@ -130,8 +139,8 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             # ★ 自证点 3：INT2 写路径真实执行（每层首写一次日志 + 字节统计）
             print(
                 f"[oscar-ascend] ★ INT2 写路径首次执行: {layer.layer_name} "
-                f"tokens={N} heads={Hk} — 每 token·head IO {160}B (原生 {2 * D}B, "
-                f"写入开销 -{(1 - 160 / (2 * D)) * 100:.1f}%)"
+                f"tokens={N} heads={Hk} — 每 token·head 逻辑槽 {160}B (原生KV {4 * D}B, "
+                f"写入开销 -{(1 - 160 / (4 * D)) * 100:.1f}%)"
             )
         self._oscar_stats["writes"] += 1
         self._oscar_stats["kv_bytes_written"] += N * Hk * 160
@@ -156,10 +165,11 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         #   2×head_size（legacy：bf16 几何，1024B/token·head，block_size=768）；
         # 且槽内落位（K 96B / V 64B）不得越界。fork 漂移/参数漏传在此拦截。
         if not getattr(self, "_oscar_geo_ok", False):
-            self._oscar_geo_ok = True
             k8 = self.key_cache.view(torch.uint8)
             v8 = self.value_cache.view(torch.uint8)
-            slot_k, slot_v = int(k8.stride(1)), int(v8.stride(1))
+            if k8.ndim != 4 or v8.ndim != 4 or not k8.is_contiguous() or not v8.is_contiguous():
+                raise ValueError("OSCAR requires contiguous [blocks, tokens, heads, bytes] caches")
+            slot_k, slot_v = int(k8.stride(2)), int(v8.stride(2))
             need_k = K_IDX_OFF + self.head_size // VALUES_PER_BYTE  # 32+64=96
             need_v = self.head_size // VALUES_PER_BYTE  # 64
             assert slot_k in (self.head_size, 2 * self.head_size), (
@@ -170,6 +180,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 f"[oscar-ascend] 槽容量不足: K 需 {need_k}B/V 需 {need_v}B "
                 f"vs 槽 {slot_k}/{slot_v}B（布局契约 N-01 越界）"
             )
+            self._oscar_geo_ok = True
             mode = (
                 "packed×2（int8 几何：512B/token·head，block_size=1536，FULL 密度×2）"
                 if slot_k == self.head_size
@@ -183,8 +194,8 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
     def _layer_rots(self, layer: torch.nn.Module, device: torch.device):
         if not getattr(layer, "_oscar_rots", None):
             cfg = self._oscar
-            rk = get_layer_rotation(cfg.k_rotation_path, layer.layer_name, self.head_size, device, mode="k")
-            rv = get_layer_rotation(cfg.v_rotation_path, layer.layer_name, self.head_size, device, mode="v")
+            rk = get_layer_rotation(cfg.k_rotation_path, layer.layer_name, self.head_size, device, mode="k", strict=True)
+            rv = get_layer_rotation(cfg.v_rotation_path, layer.layer_name, self.head_size, device, mode="v", strict=True)
             layer._oscar_rots = (rk, rv)
             layer._oscar_rkT = rk.t().contiguous()
             layer._oscar_rvT = rv.t().contiguous()
@@ -204,6 +215,8 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("OSCAR fused output quantization is unsupported")
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
@@ -218,13 +231,42 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens],
             )
             if self._oscar.window_enabled:
-                try:
-                    self._ensure_staging(layer, kv_cache)
-                    self._staging_write(layer, key, value, attn_metadata)
-                except Exception as e:  # pragma: no cover — 窗口是精度增益，失败降级纯 INT2
-                    if not getattr(layer, "_oscar_stage_skip_logged", False):
-                        layer._oscar_stage_skip_logged = True
-                        print(f"[oscar-ascend] 窗口 staging 跳过（降级纯 INT2，仅首次告警）: {e}")
+                self._ensure_staging(layer, kv_cache)
+                self._staging_write(layer, key, value, attn_metadata)
+
+        # MTP and mixed batches: retain each request's actual q_len. The fused
+        # kernel supports causal multi-query attention, unlike DecodeOnly.
+        if self._oscar.use_paged and self._oscar_use_triton and key is not None and value is not None:
+            qsl, seqs = metadata_batch_lists(attn_metadata)
+            actual = attn_metadata.num_actual_tokens
+            pairs = [(i, a, min(b, actual), seqs[i]) for i, (a, b) in enumerate(zip(qsl, qsl[1:])) if a < actual]
+            short = [(i, a, b, seq) for i, a, b, seq in pairs if 0 < b - a <= 16]
+            if short:
+                from .kernels.paged_attention import oscar_paged_attention_triton
+                rk, rv = self._layer_rots(layer, query.device)
+                stage = None
+                if self._oscar.window_enabled and self._oscar_stage_ready:
+                    stage = (layer._oscar_stage_k, layer._oscar_stage_v, layer._oscar_slot_owner)
+                token_ids = torch.tensor([t for _, a, b, _ in short for t in range(a, b)], device=query.device)
+                request_ids = torch.tensor([i for i, _, _, _ in short], device=attn_metadata.block_tables.device)
+                starts = [0]
+                for _, a, b, _ in short:
+                    starts.append(starts[-1] + b - a)
+                # Pack only short-query requests. A simultaneous long prefill
+                # must not force the entire MTP/decode batch onto the dense path.
+                out_short = oscar_paged_attention_triton(
+                    query[token_ids].float() @ rk, key[token_ids].float() @ rk, value[token_ids].float() @ rv,
+                    self.key_cache, self.value_cache, attn_metadata.block_tables[request_ids],
+                    starts, [seq for _, _, _, seq in short], self.scale, stage,
+                ) @ rv.t()
+                large = [i for i, a, b, _ in pairs if b - a > 16]
+                if large:
+                    attn_out = self._prefill_attention(query, key, value, kv_cache, attn_metadata, layer, request_indices=large)
+                else:
+                    attn_out = torch.zeros_like(query)
+                attn_out[token_ids] = out_short.to(attn_out.dtype)
+                output.copy_(attn_out.reshape(output.shape).to(output.dtype))
+                return output
 
         # 2) 读路径
         if state == getattr(AscendAttentionState, "DecodeOnly", None):
@@ -254,7 +296,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         rk, _ = self._layer_rots(layer, q.device)
         q_rot = torch.matmul(q, rk)
         bt = attn_metadata.block_tables
-        seq = attn_metadata.seq_lens
+        seq = attn_metadata.seq_lens.to(device=q.device, dtype=torch.int32)
         if self._oscar_use_triton:
             try:
                 from .kernels.decode_kernel import oscar_decode_triton
@@ -265,7 +307,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 )
             except Exception as e:  # pragma: no cover
                 print(f"[oscar-ascend] triton decode 失败，回退 torch: {e}")
-                out_rot = oscar_decode_ref(
+                out_rot, _ = oscar_decode_ref(
                     q_rot, self.key_cache, self.value_cache, bt, seq,
                     self.scale, self.num_kv_heads, self.head_size,
                 )
@@ -278,13 +320,13 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         return torch.matmul(out_rot, rv.t().contiguous())
 
     # ------------------------------------------------------------------ prefill
-    def _prefill_attention(self, query, key, value, kv_cache, attn_metadata, layer) -> torch.Tensor:
+    def _prefill_attention(self, query, key, value, kv_cache, attn_metadata, layer, request_indices=None) -> torch.Tensor:
         N, Hq, D = query.shape
         Hk = self.num_kv_heads
         qsl_list, seq_lens_list = metadata_batch_lists(attn_metadata)
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
         num_reqs = len(qsl_list) - 1
-        for i in range(num_reqs):
+        for i in (range(num_reqs) if request_indices is None else request_indices):
             q_start, q_end = qsl_list[i], qsl_list[i + 1]
             q_len = q_end - q_start
             if q_len <= 0:
@@ -307,16 +349,17 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                     self.key_cache, self.value_cache, bt_row, cached_len, Hk, D,
                     use_triton=self._oscar_use_triton,
                 )
-                k_cached = torch.matmul(k_cached.float(), layer._oscar_rkT)
-                v_cached = torch.matmul(v_cached.float(), layer._oscar_rvT)
+                rk, rv = self._layer_rots(layer, query.device)
                 if self._oscar.window_enabled and self._oscar_stage_ready:
                     k_cached, v_cached = self._stage_splice(
                         layer, bt_row, cached_len, k_cached, v_cached
                     )
                 out = oscar_prefill_ref(
-                    q_seq, k_seq, v_seq, k_cached.to(query.dtype), v_cached.to(query.dtype),
+                    (q_seq.float() @ rk).to(query.dtype), (k_seq.float() @ rk).to(query.dtype),
+                    (v_seq.float() @ rv).to(query.dtype), k_cached.to(query.dtype), v_cached.to(query.dtype),
                     self.scale, Hk, D,
                 )
+                out = out.float() @ rv.t()
             output[q_start:q_end] = out.to(query.dtype)
         return output
 
@@ -335,43 +378,56 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             self.sink_pages + self.tail_pages + 2,
         )
         dev = kv_cache[0].device
-        layer._oscar_stage_k = torch.zeros(rows, bs, self.num_kv_heads, self.head_size, dtype=torch.bfloat16, device=dev)
+        layer._oscar_stage_k = torch.zeros(rows, bs, self.num_kv_heads, self.head_size, dtype=torch.float32, device=dev)
         layer._oscar_stage_v = torch.zeros_like(layer._oscar_stage_k)
         layer._oscar_slot_owner = torch.full((rows, bs), -1, dtype=torch.int64, device=dev)
         layer._oscar_stage_rows = rows
+        layer._oscar_stage_ready = True
         self._oscar_stage_ready = True
 
     def _staging_write(self, layer, key, value, attn_metadata) -> None:
         N = attn_metadata.num_actual_tokens
-        slot = attn_metadata.slot_mapping[:N].to(torch.int64)
-        # 设备硬化：元数据可能为 CPU（vendor 变体），一律统一到 slot 设备（NPU）
-        dev = slot.device
-        seat = getattr(attn_metadata, "seq_lens", None)
-        qstart = getattr(attn_metadata, "query_start_loc", None)
-        if seat is None or qstart is None:
-            raise RuntimeError("staging 元数据缺失（seq_lens/query_start_loc）")
-        seq = seat.to(dev).to(torch.int64)
-        qsl = qstart.to(dev).to(torch.int64)
-        q_lens = qsl[1:] - qsl[:-1]
-        req = torch.repeat_interleave(torch.arange(seq.shape[0], device=slot.device), q_lens)
-        pos = seq[req] - qsl[req + 1] + torch.arange(N, device=slot.device)
-        keep = (slot >= 0) & (
-            (pos >= seq[req] - self._oscar.recent_tokens) | (pos < self.sink_eff)
+        if N == 0:
+            return
+        dev = key.device
+        slot = attn_metadata.slot_mapping[:N].to(device=dev, dtype=torch.int64)
+        # Ascend already provides cumulative query ends on the host. Clip out
+        # dummy padding requests before repeat_interleave, whose size is fixed.
+        qsl, seqs = metadata_batch_lists(attn_metadata)
+        lengths = [max(0, min(end, N) - min(start, N)) for start, end in zip(qsl, qsl[1:])]
+        req = torch.repeat_interleave(
+            torch.arange(len(lengths), device=dev),
+            torch.tensor(lengths, device=dev), output_size=N,
         )
+        seq = torch.tensor(seqs[:len(lengths)], device=dev)
+        ends = torch.tensor(qsl[1:], device=dev)
+        pos = seq[req] - ends[req] + torch.arange(N, device=dev)
+        keep = (pos >= seq[req] - self._oscar.recent_tokens) | (pos < self.sink_eff)
         bs = self.stage_block
-        if keep.numel() == 0:
+        valid = torch.nonzero(slot >= 0, as_tuple=True)[0]
+        seats = (slot[valid] // bs % layer._oscar_stage_rows) * bs + slot[valid] % bs
+        # Hash collisions: choose one deterministic writer per seat. Owners and
+        # values must come from the SAME token, including invalidating non-window
+        # writes after a physical block is recycled or a draft token is rejected.
+        order = torch.argsort(seats, stable=True)
+        sorted_seats = seats[order]
+        last = torch.cat([sorted_seats[1:] != sorted_seats[:-1],
+                          torch.ones(min(1, sorted_seats.numel()), device=dev, dtype=torch.bool)])
+        selected = valid[order[last]]
+        seats = sorted_seats[last]
+        rows, offsets = seats // bs, seats % bs
+        owner = torch.where(keep[selected], slot[selected] // bs, -1)
+        layer._oscar_slot_owner[rows, offsets] = owner
+        retained = keep[selected]
+        selected, rows, offsets = selected[retained], rows[retained], offsets[retained]
+        if selected.numel() == 0:
             return
-        rows = (slot // bs) % layer._oscar_stage_rows
-        kb, kr, ko = (slot // bs)[keep], rows[keep], (slot % bs)[keep]
-        if kb.numel() == 0:
-            return
-        layer._oscar_slot_owner.index_put_((kr, ko), kb)
-        win = layer._oscar_slot_owner[kr, ko] == kb
-        sel = keep.nonzero(as_tuple=True)[0][win]
-        key_sel = key[:N].view(N, self.num_kv_heads, self.head_size)[sel].to(torch.bfloat16)
-        val_sel = value[:N].view(N, self.num_kv_heads, self.head_size)[sel].to(torch.bfloat16)
-        layer._oscar_stage_k.index_put_((kr[win], ko[win]), key_sel)
-        layer._oscar_stage_v.index_put_((kr[win], ko[win]), val_sel)
+        rk, rv = self._layer_rots(layer, dev)
+        # Preserve the model's unquantized K/V in fp32 rotated space. No clipping
+        # or INT2 rounding is applied to staging, and historical tokens never
+        # need to be rotated again on the read path.
+        layer._oscar_stage_k[rows, offsets] = key[:N].reshape(N, self.num_kv_heads, self.head_size)[selected].float() @ rk
+        layer._oscar_stage_v[rows, offsets] = value[:N].reshape(N, self.num_kv_heads, self.head_size)[selected].float() @ rv
 
     def _stage_splice(self, layer, bt_row, cached_len, k_cached, v_cached):
         bs = self.stage_block
@@ -399,7 +455,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         dev = query.device
         owner = layer._oscar_slot_owner
         bt = attn_metadata.block_tables
-        seq = attn_metadata.seq_lens.to(torch.int64)
+        seq = attn_metadata.seq_lens.to(device=dev, dtype=torch.int64)
         maxpg = bt.shape[1]
         S_nb, TP, S_eff = self.sink_pages, self.tail_pages, self.sink_eff
         W = self._oscar.recent_tokens
@@ -443,7 +499,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         bt_eff = torch.gather(bt, 1, gidx)
         q_rot = torch.matmul(query.float(), self._layer_rots(layer, dev)[0])
         out1, lse1 = self._oscar_int2_decode(q_rot, bt_eff, seq_eff.clamp(min=0))
-        o1 = torch.matmul(out1, self._layer_rots(layer, dev)[1].t().contiguous())
+        o1 = out1
         empty1 = (seq_eff <= 0).view(B, 1)
         lse1 = torch.where(
             empty1 | ~torch.isfinite(lse1),
@@ -459,7 +515,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         kseg = layer._oscar_stage_k[rowsP].reshape(B, L, Hk, D).float()
         vseg = layer._oscar_stage_v[rowsP].reshape(B, L, Hk, D).float()
         vmask = valid.reshape(B, L)
-        qh = query.float().view(B, Hk, g, D)
+        qh = q_rot.view(B, Hk, g, D)
         sc = torch.einsum("bkgd,blkd->bkgl", qh, kseg) * self.scale
         sc = sc.masked_fill(~vmask.view(B, 1, 1, L), float("-inf"))
         m2 = sc.amax(dim=-1)
@@ -476,13 +532,14 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         lse2 = lse2.reshape(B, Hq)
 
         new_lse = torch.logaddexp(lse1, lse2)
-        w1 = torch.exp(lse1 - new_lse).unsqueeze(-1)
-        w2 = torch.exp(lse2 - new_lse).unsqueeze(-1)
-        return (o1 * w1 + torch.nan_to_num(o2) * w2).to(query.dtype)
+        safe_lse = torch.where(torch.isfinite(new_lse), new_lse, torch.zeros_like(new_lse))
+        w1 = torch.exp(lse1 - safe_lse).unsqueeze(-1)
+        w2 = torch.exp(lse2 - safe_lse).unsqueeze(-1)
+        return ((o1 * w1 + torch.nan_to_num(o2) * w2) @ self._layer_rots(layer, dev)[1].t()).to(query.dtype)
 
     def _oscar_int2_decode(self, q_rot, bt_eff, seq_eff):
         """INT2 段 decode → (out_rot[B,Hq,D], lse[B,Hq])；seq_eff<=0 时返回空。"""
-        if int(seq_eff.max().item()) <= 0:
+        if seq_eff.numel() == 0:
             B, Hq, D = q_rot.shape
             o = torch.zeros(B, Hq, D, device=q_rot.device)
             l = torch.full((B, Hq), float("-inf"), device=q_rot.device)

@@ -97,6 +97,7 @@ def get_layer_rotation(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
     mode: str = "k",
+    strict: bool = False,
 ) -> torch.Tensor:
     """返回本层 [D,D] 旋转；空路径/缺层 → 单位阵（fp32 contiguous）。
 
@@ -109,6 +110,8 @@ def get_layer_rotation(
     lid = layer_index_from_name(layer_name)
     entry = table.get(lid) if lid is not None else None
     if entry is None:
+        if strict:
+            raise ValueError(f"Rotation checkpoint {path!r} is missing layer {layer_name}")
         return torch.eye(head_dim, device=device, dtype=dtype)
     rot = entry.get("rotation_v") if mode == "v" else entry.get("rotation")
     if rot is None:
@@ -120,4 +123,7 @@ def get_layer_rotation(
             f"OSCAR rotation for layer {lid} has shape {tuple(rot.shape)}, "
             f"expected ({head_dim}, {head_dim})."
         )
+    if strict:
+        if not torch.isfinite(rot).all() or not torch.allclose(rot @ rot.t(), torch.eye(head_dim), atol=1e-3, rtol=1e-3):
+            raise ValueError(f"Rotation checkpoint {path!r} layer {lid} is not finite/orthogonal")
     return rot.to(device=device, dtype=dtype).contiguous()

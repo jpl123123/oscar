@@ -8,7 +8,7 @@
 #
 # 阶段：
 #   1) 自检     —— 版本/NPU 可见性/HAS_TRITON/入口点（只报告，严重项才 FAIL）
-#   2) 安装     —— 入口点已存在则跳过；否则 pip install --no-deps --no-build-isolation -e .
+#   2) 安装     —— 每次安装当前checkout；使用 pip install --no-deps --no-build-isolation -e .
 #   3) 指纹     —— HEAD / plugin sha256 / entry point / import
 #   4) 生成 pt  —— tools/gen_rotations.py（OSCAR 旋转检查点；已存在或 env 已给路径则跳过）
 #   5) 数值probe —— delivery/probe_oscar.py（ref + triton 双模式，阻塞 serve；
@@ -52,6 +52,10 @@ step() { echo "==> [oscar-ascend] $1"; }
 step "自检: vllm/vllm-ascend/triton/NPU 可见性/插件入口点"
 $PYTHON - <<'PY' > "$LOG_DIR/selfcheck_$STAMP.log" 2>&1 || { cat "$LOG_DIR/selfcheck_$STAMP.log"; fail "自检失败（Python 环境异常）"; }
 import importlib.metadata as md, os, sys
+from packaging.version import Version
+for package in ("vllm", "vllm-ascend"):
+    version = Version(md.version(package))
+    assert version.base_version == "0.23.0", f"Unsupported {package} version: {version}; expected 0.23.0"
 print("  CWD:", os.getcwd())
 for name in ("vllm", "vllm-ascend", "triton", "torch", "torch-npu", "torch_npu"):
     try:
@@ -89,13 +93,8 @@ step "平台注册诊断（tools/diag_platform.py，异常时请回传输出）"
 $PYTHON tools/diag_platform.py 2>&1 | tee "$LOG_DIR/diag_platform_$STAMP.log" || true
 
 # ---------- 阶段2 安装（只装插件，--no-deps 不触碰预装环境） ----------
-_ep_check() {
-    $PYTHON -c "import importlib.metadata as md; eps=[e for e in md.entry_points(group='vllm.general_plugins') if e.name=='oscar_ascend']; import sys; sys.exit(0 if eps else 1)"
-}
 if [ "${OSCAR_SKIP_INSTALL:-auto}" == "1" ]; then
     step "OSCAR_SKIP_INSTALL=1 → 跳过安装（复用已装插件）"
-elif _ep_check; then
-    step "插件入口点已存在 → 跳过安装（复用已装插件）"
 else
     step "安装插件 wheel（pip install --no-deps --no-build-isolation -e .）"
     $PYTHON -m pip install --no-deps --no-build-isolation -e "$REPO_ROOT" \
@@ -114,6 +113,8 @@ eps = [e for e in md.entry_points(group="vllm.general_plugins") if e.name == "os
 assert eps, "未发现 vllm.general_plugins entry point 'oscar_ascend'"
 print("  entry point:", eps[0].value)
 import oscar_ascend
+from pathlib import Path
+assert Path(oscar_ascend.__file__).resolve().parent == Path("oscar_ascend").resolve(), "Installed plugin is not this checkout"
 print("  oscar_ascend import OK, version", oscar_ascend.__version__)
 PY
 
@@ -213,6 +214,21 @@ if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
     fi
 else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
+fi
+
+# Multi-query kernel is gated separately: existing decode probes do not cover MTP.
+if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == "1" ] && [ "${OSCAR_ASCEND_USE_PAGED:-auto}" != "0" ]; then
+    if "$PYTHON" delivery/probe_paged.py --device npu --triton; then
+        export OSCAR_ASCEND_USE_PAGED=1
+        echo "  ✅ MTP paged probe PASS → USE_PAGED=1"
+    elif [ "$REQUIRE_TRITON" == "1" ]; then
+        fail "MTP paged probe FAIL — 拒绝启用新内核；可用 OSCAR_ASCEND_USE_PAGED=0 单独验证旧路径"
+    else
+        export OSCAR_ASCEND_USE_PAGED=0
+        echo "  ⚠️ MTP paged probe FAIL → USE_PAGED=0"
+    fi
+else
+    export OSCAR_ASCEND_USE_PAGED=0
 fi
 
 # ---------- 阶段6 serve（前台实时输出 + tee 落盘；后台观察者自动判定；不代发请求） ----------

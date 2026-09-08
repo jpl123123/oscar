@@ -47,6 +47,7 @@ class OscarAscendConfig:
     group_size: int = 0               # 0 => 每向量一组（>= head_dim 语义）
     use_triton: bool = True           # HAS_TRITON 且未强制 torch 时
     window_enabled: bool = True
+    use_paged: bool = False  # enable only after NPU paged probe
     verbose: bool = True
     extra: dict = field(default_factory=dict)
 
@@ -84,5 +85,11 @@ class OscarAscendConfig:
             use_triton=os.environ.get("OSCAR_ASCEND_USE_TRITON", "0") == "1",
             verbose=os.environ.get("OSCAR_ASCEND_VERBOSE", "1") != "0",
         )
+        cfg.window_enabled = cfg.staging_tokens > 0 and (cfg.sink_tokens > 0 or cfg.recent_tokens > 0)
+        cfg.use_paged = os.environ.get("OSCAR_ASCEND_USE_PAGED", "0") == "1"
+        if not all(0 <= r <= 1 for r in (cfg.k_clip_ratio, cfg.v_clip_ratio)):
+            raise ValueError("OSCAR clip ratios must be finite and in [0, 1]")
+        if cfg.group_size != 0:
+            raise ValueError("Only per-vector OSCAR quantization (GROUP_SIZE=0) is supported")
         cfg.extra["enable"] = os.environ.get("OSCAR_ASCEND_ENABLE", "auto")
         return cfg

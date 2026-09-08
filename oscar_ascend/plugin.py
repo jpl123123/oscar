@@ -8,7 +8,7 @@ be empty`）。因此本插件**不导入 vllm_ascend**，改为在 `Attention._
 after-hook 里做 impl 类外科手术（此时 vllm_ascend 已成为平台插件正常加载完毕）。
 
 职责：
-  1. 包装 `vllm.model_executor.layers.attention.attention.Attention.__init__`（fail-soft）；
+  1. 包装 `vllm.model_executor.layers.attention.attention.Attention.__init__`（失败中止构造）；
   2. 构造完成后：hybrid 模型 full-attention 层 → `impl.__class__` 换为
      `AscendOscarAttentionBackendImpl`（先例 kv_c8.py:130）+ `_oscar_setup()`；
   3. 心跳计数（一键脚本三防线校验）。
@@ -57,8 +57,21 @@ def _bootstrap_platform() -> None:
         )
 
 
+def install_impl(impl, target_class):
+    """Commit class surgery only if setup succeeds; preserve original state."""
+    old_class, old_state = impl.__class__, impl.__dict__.copy()
+    try:
+        impl.__class__ = target_class
+        impl._oscar_setup()
+    except Exception:
+        impl.__class__ = old_class
+        impl.__dict__.clear()
+        impl.__dict__.update(old_state)
+        raise
+
+
 def load_plugin() -> None:
-    """vllm.load_general_plugins() 调用（无参）。幂等 + fail-soft。
+    """vllm.load_general_plugins() 调用（无参）。幂等；构造失败中止。
 
     ① 每个进程（含 spawn worker）先做**平台引导**（与注入开关无关）；
     ② 注入（OSCAR impl 类外科手术）仅在 OSCAR_ASCEND_ENABLE != "0" 时安装。
@@ -120,7 +133,7 @@ def load_plugin() -> None:
                         print(
                             f"[oscar-ascend] ★ MTP 影子池生效: {layer_name} "
                             f"→ MTPShadowAttentionImpl（草稿 KV 保持 BF16，页外影子池，"
-                            f"DESIGN-E 方案 A；≈2.15GiB/rank，首请求懒分配）"
+                            f"DESIGN-E 方案 A；初始化时按预算分配）"
                         )
                         return None
                 if not _should_oscar(self, impl):
@@ -133,8 +146,9 @@ def load_plugin() -> None:
                     return None  # 上下文并行分支不替换（非本模型路径）
                 from .backend import AscendOscarAttentionBackendImpl as OscarImpl
 
-                impl.__class__ = OscarImpl
-                impl._oscar_setup()
+                install_impl(impl, OscarImpl)
+                from .integration import install_runner_hooks
+                install_runner_hooks()
                 cfg = impl._oscar
                 _HEARTBEAT["loaded"] += 1
                 layer_name = getattr(self, "layer_name", "?")
@@ -149,9 +163,9 @@ def load_plugin() -> None:
                     f"slot=160B, triton={cfg.use_triton}, "
                     f"sink={cfg.sink_tokens}/recent={cfg.recent_tokens})"
                 )
-            except Exception as e:  # pragma: no cover — fail-soft 回退原生
+            except Exception as e:  # pragma: no cover
                 _HEARTBEAT["errors"].append(str(e))
-                print(f"[oscar-ascend] 注入失败(fail-soft 回退原生): {e}")
+                raise RuntimeError(f"[oscar-ascend] 注入失败: {getattr(self, 'layer_name', '?')}: {e}") from e
             return None
 
         Attention.__init__ = _patched_init

@@ -9,8 +9,8 @@
 入参。影子池与原生逻辑视图同形状 `(nb×block_chunk, 128, Hk, D)`，逻辑块号空间与
 主池一一对应（slot_mapping / block_tables 原样复用），原生 forward 内部
 `self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]`
-（attention_v1.py:1527）会自行重绑定 → 写读其余 100% 走原生算子。
-代价 ≈ 2 × nb × block_chunk × 128 × Hk × D × 2B ≈ 2.15 GiB/rank
+会在首次使用时绑定 → 写读其余 100% 走原生算子。
+代价 ≈ 2 × nb × block_chunk × 128 × Hk × D × 2B ≈ 2.0 GiB/rank
 （nb=1369, block_chunk=12, Hk=1, D=256）。
 
 失败协议：影子池建立/替换失败**不回退原生**（int8 池上原生路径会写错数据，静默
@@ -34,6 +34,8 @@ class MTPShadowAttentionImpl(AscendAttentionBackendImpl):  # type: ignore[misc]
         if sh is not None:
             return sh
         k_native, v_native = kv_cache[0], kv_cache[1]
+        if k_native.dtype == torch.bfloat16 and v_native.dtype == torch.bfloat16:
+            return k_native, v_native
         # bf16 固定：本部署模型 bf16（w8a8 只作用权重）；形状取自原生逻辑视图，
         # 与主池几何（packed 256B 或 legacy 512B）自动同构，逻辑块号一一对应。
         self._oscar_shadow_kv = (
@@ -49,7 +51,7 @@ class MTPShadowAttentionImpl(AscendAttentionBackendImpl):  # type: ignore[misc]
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, *args, **kwargs):
         if (
-            isinstance(kv_cache, (tuple, list))
+            isinstance(kv_cache, (tuple, list, torch.Tensor))
             and len(kv_cache) >= 2
             and kv_cache[0] is not None
             and kv_cache[0].dtype != torch.bfloat16

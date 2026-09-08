@@ -1,18 +1,23 @@
 """Review reproductions without PyTorch; not numerical/NPU integration tests.
 
 Run from any directory: python3 /absolute/path/to/this/file.py
-The first two cases execute methods extracted from the actual backend AST,
+The first two cases execute methods extracted from review revision e451ca6,
 with allocation/math doubles. Remaining cases check Python indexing and
 IEEE float semantics used by the implementation.
 """
 import ast
 import struct
+import subprocess
 import sys
 import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-tree = ast.parse((ROOT / "oscar_ascend/backend.py").read_text())
+# Pin the reviewed implementation: HEAD now contains the fixes.
+source = subprocess.check_output(
+    ["git", "show", "e451ca6:oscar_ascend/backend.py"], cwd=ROOT, text=True
+)
+tree = ast.parse(source)
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
 
 

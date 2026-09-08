@@ -285,7 +285,7 @@ if triton is not None:
                 term = term * old_scale + exp_logic * o
                 e_sum = e_sum * old_scale + exp_logic
                 m = m_new
-        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term / e_sum, mask=d_mask)
+        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term / tl.maximum(e_sum, 1e-38), mask=d_mask)
         tl.store(Lse_ptr + bid * stride_lse_b + hid, m + tl.log(e_sum))
 
 
@@ -307,8 +307,10 @@ if triton is not None:  # noqa: E305
         k8, v8 = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
         bs = k8.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
-        NUM_SPLITS = max(1, min(max_num_kv_splits, max(1, int(seq_lens.max().item())))) \
-            if seq_lens.numel() > 0 else 1
+        NUM_SPLITS = max(1, max_num_kv_splits)
+        q_rot = q_rot.contiguous().float()
+        seq_lens = seq_lens.to(device=q_rot.device, dtype=torch.int32).contiguous()
+        block_table = block_table.to(device=q_rot.device).contiguous()
         mid_o = torch.empty(B, Hq, NUM_SPLITS, D + 1, dtype=torch.float32, device=q_rot.device)
         grid = (B, Hq, NUM_SPLITS)
         _oscar_decode_stage1[grid](

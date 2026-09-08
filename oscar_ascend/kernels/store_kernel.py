@@ -65,6 +65,13 @@ def oscar_store_ref(
     check_d(D)
     data_bytes = D // VALUES_PER_BYTE
     bs = k8.shape[1]
+    slot_mapping = slot_mapping.to(device=k_rot.device, dtype=torch.int64)
+    valid = slot_mapping >= 0
+    slot_mapping = slot_mapping[valid].to(device=k8.device, dtype=torch.int64)
+    k_rot, v_rot = k_rot[valid], v_rot[valid]
+    N = k_rot.shape[0]
+    if N == 0:
+        return
     k_off, v_off = _slot_bases(slot_mapping, bs, H, k8, v8)     # [N, H]
 
     k_packed, k_scale, k_zero = quantize(k_rot.float().reshape(N, H, D))

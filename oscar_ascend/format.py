@@ -35,7 +35,7 @@ V_SLOT_BYTES = SLOT_SIZE - V_IDX_OFF  # 64B
 # 数值判据
 DEQUANT_TOL = 1e-5
 DECODE_TOL = 1e-4
-SCALE_FLOOR = 1e-8
+SCALE_FLOOR = 2**-14  # smallest normal fp16; robust to device subnormal flushing
 
 
 def check_d(D: int) -> None:

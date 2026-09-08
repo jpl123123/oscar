@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import math
 import argparse
 import sys
 
@@ -99,7 +100,7 @@ def main() -> int:
     qv = torch.clamp(torch.floor((v.float() - vz) / vs + 0.5), 0, 3)
     ek = (k_rec - (qk * ks + kz)).abs().max().item()
     ev = (v_rec - (qv * vs + vz)).abs().max().item()
-    if max(ek, ev) > 1e-5:
+    if not all(math.isfinite(x) for x in (ek, ev)) or max(ek, ev) > 1e-5:
         print(f"❌ dequant err K={ek:.3e} V={ev:.3e}（判据 ≤1e-5）")
         return 1
     print(f"✅ dequant err K={ek:.3e} V={ev:.3e}（≤1e-5）")
@@ -115,7 +116,7 @@ def main() -> int:
     p = torch.softmax(scores, dim=-1)
     sdpa = torch.einsum("hl,lhd->hd", p, vd_rep)
     e = (out_ref[0] - sdpa).abs().max().item()
-    if e > 1e-4:
+    if not math.isfinite(e) or e > 1e-4:
         print(f"❌ decode err = {e:.3e}（判据 ≤1e-4）")
         return 1
     print(f"✅ decode err = {e:.3e}（≤1e-4）")
@@ -165,7 +166,7 @@ def main() -> int:
             (kt.float() - k_rec).abs().max().item(),
             (vt.float() - v_rec).abs().max().item(),
         )
-        if ed > 2 * ulp:
+        if not math.isfinite(ed) or ed > 2 * ulp:
             print(f"❌ [triton] dequant 内核 err = {ed:.3e}（判据 ≤{2 * ulp:.3e} = 2×fp16 ulp @amp={amp:.2f}）")
             return 1
         print(f"✅ [triton] dequant 内核 err = {ed:.3e}（≤{2 * ulp:.3e} = 2×fp16 ulp @amp={amp:.2f}）")
@@ -175,7 +176,7 @@ def main() -> int:
 
         out_t, _ = oscar_decode_triton(q, k_cache, v_cache, bt, seq, 0.125, Hk, D)
         et = (out_t - out_ref).abs().max().item()
-        if et > 1e-4:
+        if not math.isfinite(et) or et > 1e-4:
             print(f"❌ [triton] decode 内核 err = {et:.3e}（判据 ≤1e-4）")
             return 1
         print(f"✅ [triton] decode 内核 err = {et:.3e}（≤1e-4）")

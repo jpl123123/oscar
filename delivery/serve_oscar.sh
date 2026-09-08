@@ -43,10 +43,12 @@ export OSCAR_ASCEND_STAGING_TOKENS="${OSCAR_ASCEND_STAGING_TOKENS:-8192}"
 #    OSCAR_ASCEND_USE_TRITON=0 bash delivery/serve_oscar.sh 回退 torch 参考路径。
 export OSCAR_ASCEND_USE_TRITON="${OSCAR_ASCEND_USE_TRITON:-1}"
 
-if [ ! -f "$OSCAR_ASCEND_K_ROTATION_PATH" ]; then
-  echo "⚠️ [oscar-ascend] 旋转检查点不存在: $OSCAR_ASCEND_K_ROTATION_PATH（将以单位阵降级运行；"
-  echo "   可用 OSCAR_ASCEND_GEN_ROTATIONS=1 bash delivery/install_and_launch.sh 重新生成）"
-fi
+for rotation_path in "$OSCAR_ASCEND_K_ROTATION_PATH" "$OSCAR_ASCEND_V_ROTATION_PATH"; do
+  if [ ! -f "$rotation_path" ]; then
+    echo "❌ 旋转检查点不存在: $rotation_path；请先运行 install_and_launch.sh" >&2
+    exit 1
+  fi
+done
 
 # R6 硬性：OSCAR impl 含运行时宿主控制流（.item()/.tolist()/逐层首写日志），
 # 仅 eager 验证（参考 PR _cudagraph_support=NEVER）→ 字面 --enforce-eager 防图捕获破坏。
