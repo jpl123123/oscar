@@ -54,3 +54,19 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 新增默认关闭的 `OSCAR_ASCEND_PROFILE_STEPS`：对rank 0的前N个非空execute_model和后续sample_tokens采集同步墙钟时间、实际forward加载位置和已加载函数代码hash、OSCAR子阶段计数与耗时、PyTorch整数sort调用栈。正数显式开启；达到N后停止同步和算子追踪。嵌套阶段耗时重叠，冷调用包含编译，采集时吞吐会受到干扰。这次改动是取证工具，不宣称解决性能回归。
 
 55项本地pytest通过，包含关闭时不安装wrapper、真实CPU sort调用栈、保留结果/异常、清理诊断上下文、跳过空步骤和达到次数后停止采集。NPU同步及vendor调度接缝仍待用户环境验证。
+
+## 04:18 PERF：确认向量paged内核为主要瓶颈
+
+实际加载 `/workspace/oscar/oscar_ascend/backend.py`，Q为bf16，形状[4,6,256]，use_paged/use_triton均为true。staging容量8192。连续步骤数据（rank 0，16个FULL层累加）：
+
+| 步骤 | execute_model | paged_attention | staging_write | staging_sort |
+|---|---:|---:|---:|---:|
+| 3 | 4865 ms | 4368 ms | 60 ms | 2.21 ms |
+| 4 | 4721 ms | 4351 ms | 54 ms | 1.88 ms |
+| 5 | 4725 ms | 4353 ms | 54 ms | 1.92 ms |
+
+paged约占模型执行92%，每FULL层约272 ms；后续步骤没有随首轮编译结束而下降。此前先优化prefill/排序不能解决这项主要开销。长prefill的原生融合调用已经生效：步骤1、2、6的16层native_prefill时间分别为96、144、94 ms。整数ArgSort warning出现在6步诊断结束之后；sorts为空不能据此声称实际运行没有排序（staging_sort计时已经说明有），vendor执行还可能绕过Python dispatch追踪。
+
+本轮默认禁用自写paged内核，改用每请求一次历史反量化 + 窗口拼接 + 原生融合attention，涵盖MTP和有新K/V的DecodeOnly；显式USE_PAGED=1保留实验入口。INT2常驻缓存、旋转、当前chunk未量化K/V与窗口owner语义保留；计算使用bf16/fp16融合算子，舍入顺序与FP32向量内核不同。该路线需要临时dense KV，临时显存和端到端质量仍需复验。
+
+扩展门禁：实际6:1 GQA，24579前缀，4-token query，非单位旋转，128/1536物理页，窗口开/关，比较真实backend.forward与独立CPU分页oracle，并在预热后报告单层完整forward耗时。新增CPU回归验证DecodeOnly/SpecDecoding、非连续物理页、只反量化一次、padding不参与注意力。59项pytest及8个原有prefill case、4个24K backend case通过。本机仍无NPU，不把CPU耗时当成NPU提速结果。

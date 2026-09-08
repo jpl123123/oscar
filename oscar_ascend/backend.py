@@ -301,8 +301,12 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 output.copy_(attn_out.reshape(output.shape).to(output.dtype))
                 return output
 
-        # 2) 读路径
-        if state == getattr(AscendAttentionState, "DecodeOnly", None):
+        # The vector paged kernel took ~4.35 s over 16 layers for a 4-token
+        # MTP step on the target NPU. With fresh K/V, use dense reconstruction
+        # plus native fused attention by default, including DecodeOnly.
+        if key is not None and value is not None:
+            attn_out = self._prefill_attention(query, key, value, kv_cache, attn_metadata, layer)
+        elif state == getattr(AscendAttentionState, "DecodeOnly", None):
             attn_out = self._decode_attention(query, kv_cache, attn_metadata, layer)
         else:
             attn_out = self._prefill_attention(query, key, value, kv_cache, attn_metadata, layer)
@@ -358,9 +362,10 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         Hk = self.num_kv_heads
         qsl_list, seq_lens_list = metadata_batch_lists(attn_metadata)
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
+        actual = min(N, getattr(attn_metadata, "num_actual_tokens", N))
         num_reqs = len(qsl_list) - 1
         for i in (range(num_reqs) if request_indices is None else request_indices):
-            q_start, q_end = qsl_list[i], qsl_list[i + 1]
+            q_start, q_end = qsl_list[i], min(qsl_list[i + 1], actual)
             q_len = q_end - q_start
             if q_len <= 0:
                 continue

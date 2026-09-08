@@ -5,13 +5,13 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前版本 0.2.0：用户已通过基础 NPU 数值门禁并成功启动，但服务日志显示严重性能退化。本轮新增原生融合 prefill、staging 排序优化及 paged 分块调整；CPU 回归通过，改动仍待 NPU 数值与性能复验。不能将 CPU PASS 或 ACTIVE 判定视为吞吐验收。**
+**当前版本 0.2.0：真机诊断已确认，向量paged内核在4-token MTP步骤中占约92%的模型执行时间。默认已切换为INT2历史反量化 + 原生融合注意力，保留窗口和旋转；CPU回归通过，新的短MTP路径仍待NPU数值和性能复验。**
 
 ## 本轮变化
 
 - 修复窗口每步清空、负 slot 写坏尾部缓存、CPU seq metadata 误用、decode 异常回退、类替换失败未恢复以及多 KV head 的几何检查。
 - sink/recent 保留未量化数据，写入时旋转到 FP32 空间；避免历史 KV 反复逆旋转。窗口现在跨步保留，哈希碰撞选择同一个 owner/value 写入者，非窗口重写会使旧 tag 失效。
-- 新增 MTP 多 query 分页 Triton attention：直接从 INT2 历史缓存读取，当前 chunk 使用未量化 K/V，窗口按 owner tag 覆盖。每请求 q_len≤16 时可走此路径；混合批次中的长 prefill 单独走 dense 路径。
+- MTP默认每请求反量化一份INT2历史，叠加窗口，再用原生融合注意力处理当前chunk。自写多query分页Triton内核保留为显式实验路径，当前不推荐用于服务。
 - dense continuation 在旋转域计算，只对新 Q/K/V 和最终输出旋转；NPU 使用原生融合注意力，仍会物化历史 KV。CPU 保留 SDPA oracle。
 - staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；启动门禁增加16K前缀与真实1536-token页。paged分块32在目标910B4编译时出现UB溢出，默认已恢复为通过过真机门禁的4。
 - MTP BF16 影子池、FP32 窗口、旋转矩阵纳入常驻内存预算，并在缓存初始化时分配、检查。临时算子的峰值内存仍需 NPU 压测。
@@ -30,7 +30,7 @@ python3 -m venv .venv
 .venv/bin/python delivery/probe_paged.py --device cpu
 ```
 
-本轮执行：backend/prefill/版本/类型/分块配置回归51项通过，新增prefill因果与16K分页CPU镜像通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮执行：backend/prefill/版本/类型/分块配置/诊断回归59项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
@@ -50,9 +50,8 @@ python3 delivery/probe_prefill.py --device npu
 bash delivery/install_and_launch.sh
 ```
 
-一键脚本在旧内核门禁及 `probe_paged.py` 通过后设置 `OSCAR_ASCEND_USE_PAGED=1`。
-默认硬门禁下，paged probe失败会阻断启动；可显式 `OSCAR_ASCEND_USE_PAGED=0` 验证dense路径。
-直接运行 `serve_oscar.sh` 默认不启用新分页内核，且要求 K/V 旋转文件存在。
+一键脚本默认 `OSCAR_ASCEND_USE_PAGED=0`，运行基础门禁和扩展后的 `probe_prefill.py`（含24K MTP完整forward）。只有显式设置 `OSCAR_ASCEND_USE_PAGED=1` 才测试并启用自写分页内核。
+直接运行 `serve_oscar.sh` 同样默认原生融合读取，且要求 K/V 旋转文件存在。
 
 服务默认：模型 `/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp`、TP4、NPU 0–3、端口8989、MTP草稿3 tokens、eager。可用 `MODEL_PATH`、`ASCEND_RT_VISIBLE_DEVICES` 和 `OSCAR_EXTRA_ARGS` 调整。
 
@@ -87,7 +86,7 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 | `OSCAR_ASCEND_ENABLE` | `auto`；`0` 禁用接入 |
 | `OSCAR_ASCEND_PACKED` | serve默认1；0使用BF16物理槽几何 |
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
-| `OSCAR_ASCEND_USE_PAGED` | 插件默认0；一键paged门禁通过后设为1；每请求q_len≤16使用新内核 |
+| `OSCAR_ASCEND_USE_PAGED` | 默认0：INT2反量化 + 原生融合attention；1显式测试并启用自写分页内核（目前真机很慢） |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |

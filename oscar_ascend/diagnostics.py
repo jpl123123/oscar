@@ -109,6 +109,9 @@ def timed(label, fn):
                 "query_dtype": str(query.dtype),
                 "use_triton": impl._oscar_use_triton,
                 "use_paged": impl._oscar.use_paged,
+                "cache_shape": list(impl.key_cache.shape)
+                if impl.key_cache is not None
+                else None,
                 "stage_capacity": getattr(layer, "_oscar_stage_rows", 0)
                 * getattr(impl, "stage_block", 0),
             }

@@ -221,7 +221,9 @@ if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
         || fail "原生融合 prefill probe FAIL — 拒绝 serve"
 fi
 
-if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == "1" ] && [ "${OSCAR_ASCEND_USE_PAGED:-auto}" != "0" ]; then
+# The vector paged kernel is an explicit experiment: target profiling measured
+# ~4.35 s / 16 FULL layers. Default to INT2 reconstruction + native attention.
+if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == "1" ] && [ "${OSCAR_ASCEND_USE_PAGED:-0}" == "1" ]; then
     if "$PYTHON" delivery/probe_paged.py --device npu --triton; then
         export OSCAR_ASCEND_USE_PAGED=1
         echo "  ✅ MTP paged probe PASS → USE_PAGED=1"
@@ -233,6 +235,7 @@ if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == 
     fi
 else
     export OSCAR_ASCEND_USE_PAGED=0
+    echo "  OSCAR 读取: INT2 历史反量化 + 原生融合 attention（USE_PAGED=0）"
 fi
 
 # ---------- 阶段6 serve（前台实时输出 + tee 落盘；后台观察者自动判定；不代发请求） ----------

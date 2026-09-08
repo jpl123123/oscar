@@ -92,6 +92,26 @@ def main():
             "rotated_dense": lambda: dense(False),
         }
 
+        def reconstructed_native():
+            kr, vr = oscar_full_dequant(
+                kc, vc, bt[0], length, hk, d, use_triton=args.triton
+            )
+            return (
+                oscar_prefill(
+                    (q @ rk).to(torch.bfloat16),
+                    (k @ rk).to(torch.bfloat16),
+                    (v @ rv).to(torch.bfloat16),
+                    kr.to(torch.bfloat16),
+                    vr.to(torch.bfloat16),
+                    d**-0.5,
+                    hk,
+                    d,
+                ).float()
+                @ rv.t()
+            )
+
+        paths["reconstructed_native_bf16"] = reconstructed_native
+
         def paged(tile):
             return (
                 oscar_paged_attention_triton(
@@ -121,7 +141,8 @@ def main():
         for name, fn in paths.items():
             actual = fn()
             assert torch.isfinite(actual).all().item()
-            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+            tolerance = 1e-2 if name == "reconstructed_native_bf16" else 2e-3
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
             for _ in range(3):
                 fn()
             sync()

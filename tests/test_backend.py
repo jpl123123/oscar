@@ -463,3 +463,46 @@ def test_staging_sort_exact_and_stable_at_float32_boundary(monkeypatch, capacity
     monkeypatch.setattr(torch, "argsort", checked)
     assert torch.equal(staging_order(seats, capacity), expected)
     assert seen == [torch.float32 if capacity <= 2**24 else torch.int64]
+
+
+@pytest.mark.parametrize("state_name", ["DecodeOnly", "SpecDecoding"])
+@pytest.mark.parametrize("window", [False, True])
+def test_native_mtp_default_preserves_history_window_and_padding(monkeypatch, state_name, window):
+    from oscar_ascend import backend
+
+    impl, layer, cache = fixture()
+    impl.num_heads = 6
+    impl._oscar.use_paged = False
+    impl._oscar_use_triton = False
+    impl._oscar.window_enabled = window
+    rk, rv = [torch.linalg.qr(torch.randn(64, 64)).Q for _ in range(2)]
+    layer._oscar_rots = (rk, rv)
+    oldk, oldv = [torch.randn(9, 1, 64) for _ in range(2)]
+    oldslots = [16, 17, 18, 19, 4, 5, 0, 1, 2]
+    impl.do_kv_cache_update(layer, oldk, oldv, cache, torch.tensor(oldslots))
+    if window:
+        impl._ensure_staging(layer, cache)
+        impl._staging_write(layer, oldk, oldv, meta(oldslots, [6, 9], [6, 3]))
+    q, k, v = torch.randn(6, 6, 64), torch.randn(6, 1, 64), torch.randn(6, 1, 64)
+    md = meta([6, 7, 24, 25, 3], [4, 5, 6], [10, 4, 0], bt=[[4, 1, 6], [0, 0, 0], [0, 0, 0]])
+    md.attn_state = getattr(backend.AscendAttentionState, state_name)
+    seen = []
+    original = backend.oscar_full_dequant
+
+    def dequant(*args, **kwargs):
+        seen.append(args[3])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "oscar_full_dequant", dequant)
+    monkeypatch.setattr("oscar_ascend.kernels.paged_attention.oscar_paged_attention_triton",
+                        lambda *a, **k: pytest.fail("slow vector kernel used"))
+    monkeypatch.setattr(impl, "_decode_attention", lambda *a: pytest.fail("legacy decode used"))
+    actual = impl.forward(layer, q, k, v, cache, md, output=torch.empty_like(q))
+    stage = None if not window else (layer._oscar_stage_k, layer._oscar_stage_v, layer._oscar_slot_owner)
+    expected = oscar_paged_attention_ref(
+        q[:5] @ rk, k[:5] @ rk, v[:5] @ rv, *cache, md.block_tables[:2],
+        [0, 4, 5], [10, 4], impl.scale, stage,
+    ) @ rv.t()
+    assert seen == [6, 3]  # One reconstruction per request, not per query.
+    torch.testing.assert_close(actual[:5], expected, atol=1e-5, rtol=1e-4)
+    assert torch.count_nonzero(actual[5:]) == 0
