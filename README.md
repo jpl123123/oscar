@@ -72,7 +72,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 服务仍慢时，先停旧服务，再采集一次有界诊断：
 
 ```bash
-OSCAR_ASCEND_PROFILE_STEPS=6 bash delivery/install_and_launch.sh
+./diag
 # 使用原有客户端发送同一批请求后，从另一终端提取诊断行
 grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 ```

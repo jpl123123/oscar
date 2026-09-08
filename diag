@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Short entry point: verify/install, then profile six serving steps.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export OSCAR_ASCEND_PROFILE_STEPS=6
+exec bash "$REPO_ROOT/delivery/install_and_launch.sh" "$@"
