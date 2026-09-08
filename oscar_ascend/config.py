@@ -49,6 +49,8 @@ class OscarAscendConfig:
     window_enabled: bool = True
     use_paged: bool = False  # enable only after NPU paged probe
     use_fused_prep: bool = False  # enable after native MTP preparation probe
+    attention_mode: str = "streaming"
+    stream_workspace_bytes: int = 32 * 1024 * 1024
     verbose: bool = True
     extra: dict = field(default_factory=dict)
 
@@ -69,7 +71,7 @@ class OscarAscendConfig:
         return 1 if self.group_size == 0 else -(-self.head_dim // self.group_size)
 
     @classmethod
-    def from_env(cls, head_dim: int | None = None) -> "OscarAscendConfig":
+    def from_env(cls, head_dim: int | None = None) -> OscarAscendConfig:
         D = head_dim if head_dim is not None else _env_int("OSCAR_ASCEND_HEAD_DIM", D_DEFAULT)
         cfg = cls(
             head_dim=D,
@@ -89,6 +91,10 @@ class OscarAscendConfig:
         cfg.window_enabled = cfg.staging_tokens > 0 and (cfg.sink_tokens > 0 or cfg.recent_tokens > 0)
         cfg.use_paged = os.environ.get("OSCAR_ASCEND_USE_PAGED", "0") == "1"
         cfg.use_fused_prep = os.environ.get("OSCAR_ASCEND_FUSED_PREP", "0") == "1"
+        cfg.attention_mode = os.environ.get("OSCAR_ASCEND_ATTENTION_MODE", "streaming")
+        cfg.stream_workspace_bytes = max(0, _env_int("OSCAR_ASCEND_STREAM_WORKSPACE_MIB", 32)) * 1024 * 1024
+        if cfg.attention_mode not in ("streaming", "native"):
+            raise ValueError("OSCAR_ASCEND_ATTENTION_MODE must be streaming or native")
         if not all(0 <= r <= 1 for r in (cfg.k_clip_ratio, cfg.v_clip_ratio)):
             raise ValueError("OSCAR clip ratios must be finite and in [0, 1]")
         if cfg.group_size != 0:

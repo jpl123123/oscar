@@ -6,7 +6,9 @@ import time
 import torch
 
 
-def compare_calls(calls, sync, repeats=6, *, clock=time.perf_counter):
+def compare_calls(
+    calls, sync, repeats=6, *, clock=time.perf_counter, label="PREP BENCH"
+):
     if repeats < 2:
         raise ValueError("A/B timing requires at least two rounds")
     names = list(calls)
@@ -22,7 +24,7 @@ def compare_calls(calls, sync, repeats=6, *, clock=time.perf_counter):
         return value, (clock() - start) * 1000
 
     for name, fn in calls.items():
-        print(f"PREP BENCH first call: {name}", flush=True)
+        print(f"{label} first call: {name}", flush=True)
         value, first[name] = measure(fn)
         # Outputs may share the same destination buffer across variants.
         outputs[name] = value.detach().float().cpu().clone()

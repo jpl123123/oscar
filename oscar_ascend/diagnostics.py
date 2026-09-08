@@ -114,6 +114,7 @@ def timed(label, fn):
                 "use_triton": impl._oscar_use_triton,
                 "use_paged": impl._oscar.use_paged,
                 "use_fused_prep": impl._oscar.use_fused_prep,
+                "attention_mode": impl._oscar.attention_mode,
                 "cache_shape": list(impl.key_cache.shape)
                 if impl.key_cache is not None
                 else None,
@@ -184,7 +185,7 @@ def install_diagnostics(runner_class):
     if min_requests < 0 or max_per_request < 0:
         raise ValueError("OSCAR diagnostic request filters must be nonnegative")
     from . import backend
-    from .kernels import paged_attention, prefill
+    from .kernels import paged_attention, prefill, streaming_attention
 
     cls = backend.AscendOscarAttentionBackendImpl
     for name in (
@@ -203,6 +204,9 @@ def install_diagnostics(runner_class):
     )
     prefill.npu_prefill_prepared = timed(
         "native_attention", prefill.npu_prefill_prepared
+    )
+    streaming_attention.streaming_attention_triton = timed(
+        "streaming_attention", streaming_attention.streaming_attention_triton
     )
     original_execute = runner_class.execute_model
     original_sample = runner_class.sample_tokens

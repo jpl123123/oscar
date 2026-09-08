@@ -30,6 +30,7 @@ def fixture(hk=1, dtype=torch.bfloat16, d=64):
     impl.scale = d**-0.5
     impl.key_cache = impl.value_cache = None
     impl._oscar_setup()
+    impl._oscar.attention_mode = "native"  # historical-path regression fixtures
     impl._oscar.sink_tokens = 4
     impl._oscar.recent_tokens = 4
     impl._oscar.staging_tokens = 8

@@ -32,6 +32,22 @@ def source_fingerprint():
     return digest.hexdigest()
 
 
+def streaming_reserve(impls, max_tokens):
+    """Reserve one worker's peak query/split work, not a BF16 history cache."""
+    active = [impl for impl in impls if impl._oscar.attention_mode == "streaming"]
+    if not active:
+        return 0
+    if max_tokens <= 0:
+        raise ValueError("Streaming reserve requires max_num_batched_tokens")
+    # Conservative allowance for rotated current tensors, output/inverse
+    # rotation, and current-KV write temporaries. These scale with query work.
+    return max(
+        impl._oscar.stream_workspace_bytes
+        + max_tokens * impl.head_size * 4 * (3 * impl.num_heads + 4 * impl.num_kv_heads)
+        for impl in active
+    )
+
+
 def verify_layers(layer_types, actual_ids):
     expected = {
         i
@@ -111,6 +127,13 @@ def install_runner_hooks():
                     fixed += (
                         rows * bs * (2 * impl.num_kv_heads * impl.head_size * 4 + 8)
                     )
+        workspace = streaming_reserve(
+            [m.impl for m in targets],
+            getattr(
+                getattr(cfg, "scheduler_config", None), "max_num_batched_tokens", 0
+            ),
+        )
+        fixed += workspace
         budget = memory_budget(available, native, shadow, fixed)
         runner._oscar_memory_plan = {
             "available": available,
@@ -118,6 +141,7 @@ def install_runner_hooks():
             "shadow": shadow,
             "fixed": fixed,
             "budget": budget,
+            "streaming_transient_bytes": workspace,
         }
         worker.available_kv_cache_memory_bytes = budget
         print(
@@ -163,7 +187,10 @@ def install_runner_hooks():
         if names:
             plan = runner._oscar_memory_plan
             native_bytes = sum(t.size for t in config.kv_cache_tensors)
-            if native_bytes + persistent > plan["available"]:
+            if (
+                native_bytes + persistent + plan["streaming_transient_bytes"]
+                > plan["available"]
+            ):
                 raise RuntimeError(
                     "Actual OSCAR persistent allocation exceeds profiled budget"
                 )
@@ -177,6 +204,7 @@ def install_runner_hooks():
                 "shadow_layers": shadows,
                 "native_bytes": native_bytes,
                 "persistent_bytes": persistent,
+                "streaming_transient_bytes": plan["streaming_transient_bytes"],
                 "source": str(Path(__file__).parent.resolve()),
                 "sha256": source_fingerprint(),
                 "verified": True,

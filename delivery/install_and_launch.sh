@@ -215,7 +215,24 @@ else
     echo "  OSCAR_SKIP_PROBES=1 → 跳过 probe（仅诊断用，禁止用于正式交付验收）"
 fi
 
-# Multi-query kernel is gated separately: existing decode probes do not cover MTP.
+# Validate the new no-dense-history path before enabling it in workers.
+export OSCAR_ASCEND_ATTENTION_MODE="${OSCAR_ASCEND_ATTENTION_MODE:-streaming}"
+if [ "$OSCAR_ASCEND_ATTENTION_MODE" == "streaming" ]; then
+    [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] || fail "Streaming mode requires its NPU gates"
+    [ "${OSCAR_ASCEND_USE_TRITON:-1}" == "1" ] || fail "Streaming mode requires Triton"
+    "$PYTHON" delivery/probe_streaming.py --device npu \
+        || fail "Streaming 数值/生命周期门禁失败 — 不启用完整历史回退"
+    "$PYTHON" tools/benchmark_streaming.py --device npu --gate 2>&1 | tee "$LOG_DIR/streaming_bench_$STAMP.log" \
+        || fail "Streaming 性能门禁失败 — 见 $LOG_DIR/streaming_bench_$STAMP.log"
+    export OSCAR_ASCEND_USE_PAGED=0
+    export OSCAR_ASCEND_FUSED_PREP=0
+    echo "  OSCAR 读取: 分块矩阵 attention；无完整历史 KV 临时张量"
+elif [ "$OSCAR_ASCEND_ATTENTION_MODE" != "native" ]; then
+    fail "OSCAR_ASCEND_ATTENTION_MODE 必须为 streaming 或 native"
+fi
+
+# Explicit legacy native mode remains available for controlled comparisons.
+if [ "$OSCAR_ASCEND_ATTENTION_MODE" == "native" ]; then
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
     # Fused preparation passed numerics but did not improve target NPU timing.
     PREP_MODE="${OSCAR_ASCEND_FUSED_PREP:-0}"
@@ -241,6 +258,7 @@ if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == 
 else
     export OSCAR_ASCEND_USE_PAGED=0
     echo "  OSCAR 读取: INT2 历史反量化 + 原生融合 attention（USE_PAGED=0）"
+fi
 fi
 
 # ---------- 阶段6 serve（前台实时输出 + tee 落盘；后台观察者自动判定；不代发请求） ----------

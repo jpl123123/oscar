@@ -5,18 +5,19 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前版本 0.2.0：默认采用INT2历史反量化 + 原生融合注意力，保留窗口和旋转，已取得MTP实测改善。自写paged与KV准备融合均保留为实验路径，默认关闭。**
+**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。新内核已通过CPU数学/索引/生命周期回归，尚待目标NPU编译、数值和性能门禁验收。**
 
-真机复测：原生融合读取使重复MTP步骤的execute_model由约4.72秒降至0.556秒（同步诊断口径约8.5倍，非端到端吞吐倍数）。随后KV准备融合在另一次运行中记录约0.599秒，没有证明进一步提速，因此默认恢复独立反量化/窗口拼接；性能实验采用同进程交错A/B比较。
+历史实测：原生融合读取曾使重复MTP步骤由约4.72秒降至0.556秒，但仍反复物化完整历史；后续KV准备融合未证明提速。该路径现在作为显式`native`对照保留。streaming为新的矩阵实现，不能沿用之前8.5倍的数字宣称自身收益。实现细节见 [streaming改造与验收](plan/IMPLEMENTATION-STREAMING-20260908.md)。
 
 ## 本轮变化
 
 - 修复窗口每步清空、负 slot 写坏尾部缓存、CPU seq metadata 误用、decode 异常回退、类替换失败未恢复以及多 KV head 的几何检查。
 - sink/recent 保留未量化数据，写入时旋转到 FP32 空间；避免历史 KV 反复逆旋转。窗口现在跨步保留，哈希碰撞选择同一个 owner/value 写入者，非窗口重写会使旧 tag 失效。
-- MTP默认每请求反量化一份INT2历史，叠加窗口，再用原生融合注意力处理当前chunk。自写多query分页Triton内核保留为显式实验路径，当前不推荐用于服务。
-- dense continuation 在旋转域计算，只对新 Q/K/V 和最终输出旋转；NPU 使用原生融合注意力，仍会物化历史 KV。CPU 保留 SDPA oracle。
+- 默认按32个KV token、64个通道的小块解码，在一组query/head之间共享并用`tl.dot`计算，在线softmax归并；不生成随历史长度增长的全局dense KV。
+- cache-only decode、混合请求和有历史的长continuation都走新路径；混批中的无历史prefill单独使用原生attention，保留当前chunk的未量化语义。
+- standalone KV update会立即使被重写位置的staging标签失效，防止cache-only读取旧窗口值。MTP拒绝后的尾部重写、block回收和padding有回归覆盖。
 - staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；启动门禁增加16K前缀与真实1536-token页。paged分块32在目标910B4编译时出现UB溢出，默认已恢复为通过过真机门禁的4。
-- MTP BF16 影子池、FP32 窗口、旋转矩阵纳入常驻内存预算，并在缓存初始化时分配、检查。临时算子的峰值内存仍需 NPU 压测。
+- MTP BF16影子池、FP32窗口、旋转矩阵继续计入常驻预算；新split暂存和本步query变换的保守临时预留按worker计入预算，不按层复制大工作区。
 - 启动 READY manifest 按 TP rank 检查 FULL 层覆盖和源码指纹。安装器默认重装当前 checkout 的 editable 包，避免复用旧 wheel。
 - probe 显式拒绝 NaN/Inf。新内核有独立跨页、多请求和空段 NPU 门禁。
 
@@ -28,15 +29,15 @@ FP32 staging 的容量约为旧 BF16 staging 的两倍（D=256/Hk=1/8192 tokens 
 python3 -m venv .venv
 .venv/bin/python -m pip install torch pytest numpy
 .venv/bin/python tests/test_numeric.py
-.venv/bin/python -m pytest tests/test_backend.py -q
-.venv/bin/python delivery/probe_paged.py --device cpu
+.venv/bin/python -m pytest -q
+.venv/bin/python delivery/probe_streaming.py --device cpu
 ```
 
-本轮执行：backend/prefill/版本/类型/分块配置/诊断/准备缓冲/A/B工具回归77项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮验证包含实际JIT源码的CPU数学与越界检查模拟、在线softmax独立对照，以及禁止调用全历史反量化/拼接的backend测试。CPU使用PyTorch 2.14.0，不验证Ascend编译器的UB规划或设备性能；pytest默认只收集本仓库tests，不运行reference的手动测试。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
-完整评测约88分钟对比base约10分钟的当前代码分析、改进顺序与有条件的加速预期，见 [端到端慢速分析与改进计划](plan/audits/END_TO_END_SLOWNESS_AND_PLAN-20260908.md)。报告区分整集结果、单步诊断和工程预测。
+完整评测约88分钟对比base约10分钟的ac94f31代码快照分析、改进顺序与有条件的加速预期，见 [端到端慢速分析与改进计划](plan/audits/END_TO_END_SLOWNESS_AND_PLAN-20260908.md)。该历史报告不代表新streaming实现已经达到其中的目标。
 
 ## NPU 验证与启动
 
@@ -47,15 +48,15 @@ python3 -m venv .venv
 python3 -m pip install --no-deps --no-build-isolation -e .
 
 # 新内核独立门禁（不会向外部服务发请求）
-python3 delivery/probe_paged.py --device npu --triton
-python3 delivery/probe_prefill.py --device npu
+python3 delivery/probe_streaming.py --device npu
+./bench
 
 # 一键：环境/版本检查、安装、校准、数值门禁，再前台启动服务
 bash delivery/install_and_launch.sh
 ```
 
-一键脚本默认 `OSCAR_ASCEND_USE_PAGED=0`，运行基础门禁和扩展后的 `probe_prefill.py`（含24K MTP完整forward）。只有显式设置 `OSCAR_ASCEND_USE_PAGED=1` 才测试并启用自写分页内核。
-直接运行 `serve_oscar.sh` 同样默认原生融合读取，且要求 K/V 旋转文件存在。
+一键默认`OSCAR_ASCEND_ATTENTION_MODE=streaming`。先跑数值和生命周期门禁，再在同一输入上比较单请求24K MTP、8请求24K MTP及15360+9256 continuation。任何形状的预热中位耗时若比native对照高超过10%，会停止启动并留下`streaming_bench_*.log`；不会静默回退完整历史物化。此门槛只是防止明显回退，不能替代完整LongBench/吞吐验收。
+显式`OSCAR_ASCEND_ATTENTION_MODE=native`保留上一版对照。直接运行`serve_oscar.sh`也默认streaming，但不执行前置门禁，正式复测应使用一键入口。
 
 服务默认：模型 `/softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp`、TP4、NPU 0–3、端口8989、MTP草稿3 tokens、eager。可用 `MODEL_PATH`、`ASCEND_RT_VISIBLE_DEVICES` 和 `OSCAR_EXTRA_ARGS` 调整。
 
@@ -72,7 +73,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
 
-停服务后运行 `./bench`，可在同一份输入和缓存上交错比较旧、新KV准备路径。覆盖实际6:1 GQA、128-token物理页、窗口和serve裁剪默认值，以及24579历史+4-token MTP、15360历史+9256-token continuation两种形状。输出 `PREP BENCH` JSON中的首次调用耗时、6次交错采样、中位数与数值匹配结果；`baseline_over_fused > 1`才表示候选更快。首次调用可能命中已有编译缓存，不能把它一概称为纯编译耗时。该工具只测单层，不启动服务、不切换服务默认值。
+停服务后运行`./bench`，现在比较native完整历史对照和新的streaming路径，包括1/8请求MTP及continuation。输出`STREAM BENCH`中的首次调用、6次交错采样、中位数和`baseline_over_streaming`；>1表示新路径更快。暂存字节是计算量，不是设备峰值。旧KV准备融合的A/B工具仍在`tools/benchmark_prep.py`。工具不启动服务、不切换默认值。
 
 服务仍慢时，先停旧服务，再采集一次有界诊断：
 
@@ -94,7 +95,9 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 | `OSCAR_ASCEND_ENABLE` | `auto`；`0` 禁用接入 |
 | `OSCAR_ASCEND_PACKED` | serve默认1；0使用BF16物理槽几何 |
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
-| `OSCAR_ASCEND_USE_PAGED` | 默认0：INT2反量化 + 原生融合attention；1显式测试并启用自写分页内核（目前真机很慢） |
+| `OSCAR_ASCEND_ATTENTION_MODE` | 默认streaming；native显式启用原完整历史对照。streaming在NPU要求Triton，不提供dense fallback |
+| `OSCAR_ASCEND_STREAM_WORKSPACE_MIB` | 默认32，仅限制split暂存；0使用单split。查询输入/输出和变换临时量另作worker预留，不代表整模型峰值上限 |
+| `OSCAR_ASCEND_USE_PAGED` | 仅native对照模式下有效；默认0，1启用旧向量paged实验 |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |
 | `OSCAR_ASCEND_PROFILE_MIN_REQUESTS` | 默认0不筛选；只采集至少此数量的正调度请求，`./load`设为8 |

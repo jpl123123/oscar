@@ -58,7 +58,7 @@ def test_capture_preserves_exceptions_and_resets_context(capsys):
 @pytest.mark.parametrize("filtered", [False, True])
 def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys, filtered):
     from oscar_ascend import backend
-    from oscar_ascend.kernels import paged_attention, prefill
+    from oscar_ascend.kernels import paged_attention, prefill, streaming_attention
 
     class Impl:
         forward = do_kv_cache_update = _rotate_clip = _staging_write = (
@@ -75,6 +75,11 @@ def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys, fi
         paged_attention.oscar_paged_attention_triton,
     )
     monkeypatch.setattr(prefill, "npu_prefill_prepared", prefill.npu_prefill_prepared)
+    monkeypatch.setattr(
+        streaming_attention,
+        "streaming_attention_triton",
+        streaming_attention.streaming_attention_triton,
+    )
     monkeypatch.setenv("OSCAR_ASCEND_PROFILE_STEPS", "2")
     monkeypatch.setenv("OSCAR_ASCEND_PROFILE_MIN_REQUESTS", "2" if filtered else "0")
     monkeypatch.setenv(

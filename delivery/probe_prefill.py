@@ -152,6 +152,7 @@ def check_native_mtp(
             impl.scale = d**-0.5
             impl.key_cache = impl.value_cache = None
             impl._oscar_setup()
+            impl._oscar.attention_mode = "native"  # this probe also provides the baseline for A/B
             impl._oscar.use_paged = False
             impl._oscar.use_fused_prep = (
                 os.environ.get("OSCAR_ASCEND_FUSED_PREP", "0") == "1"

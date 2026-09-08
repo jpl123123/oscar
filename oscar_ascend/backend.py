@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 from importlib import import_module, util
+from itertools import pairwise
 
 import torch
 
@@ -165,6 +166,14 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         k_cache, v_cache = self.key_cache, self.value_cache
         k = key[:N].view(N, Hk, D)
         v = value[:N].view(N, Hk, D)
+        # A direct KV-update call can be followed by cache-only decode, with no
+        # staging_write to refresh tags. Invalidate overwritten seats now; the
+        # normal forward refreshes retained unquantized values immediately after.
+        if getattr(layer, "_oscar_stage_ready", False):
+            valid_slots = slot_mapping[slot_mapping >= 0]
+            bs = self.stage_block
+            rows = valid_slots // bs % layer._oscar_stage_rows
+            layer._oscar_slot_owner[rows, valid_slots % bs] = -1
         rk, rv = self._layer_rots(layer, k.device)
         k_rot = self._rotate_clip(k, rk, self._oscar.k_clip_ratio)
         v_rot = self._rotate_clip(v, rv, self._oscar.v_clip_ratio)
@@ -216,12 +225,13 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             )
             self._oscar_geo_ok = True
             mode = (
-                "packed×2（int8 几何：512B/token·head，block_size=1536，FULL 密度×2）"
+                "packed×2（int8 槽几何）"
                 if slot_k == self.head_size
-                else "legacy（bf16 几何：1024B/token·head，block_size=768，无显存收益）"
+                else "legacy（bf16 槽几何）"
             )
             print(
                 f"[oscar-ascend] ★ 几何对账: K 槽 {slot_k}B / V 槽 {slot_v}B → {mode}；"
+                f"合计 {slot_k + slot_v}B/token·head，kernel_block_size={self.key_cache.shape[1]}；"
                 f"槽内落位 K{need_k}B+V{need_v}B 无越界"
             )
 
@@ -268,12 +278,15 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                 self._ensure_staging(layer, kv_cache)
                 self._staging_write(layer, key, value, attn_metadata)
 
+        if self._oscar.attention_mode == "streaming":
+            return self._streaming_attention(layer, query, key, value, kv_cache, attn_metadata, output)
+
         # MTP and mixed batches: retain each request's actual q_len. The fused
         # kernel supports causal multi-query attention, unlike DecodeOnly.
         if self._oscar.use_paged and self._oscar_use_triton and key is not None and value is not None:
             qsl, seqs = metadata_batch_lists(attn_metadata)
             actual = attn_metadata.num_actual_tokens
-            pairs = [(i, a, min(b, actual), seqs[i]) for i, (a, b) in enumerate(zip(qsl, qsl[1:])) if a < actual]
+            pairs = [(i, a, min(b, actual), seqs[i]) for i, (a, b) in enumerate(pairwise(qsl)) if a < actual]
             short = [(i, a, b, seq) for i, a, b, seq in pairs if 0 < b - a <= 16]
             if short:
                 from .kernels.paged_attention import oscar_paged_attention_triton
@@ -316,6 +329,72 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             output[:num_tokens] = attn_out[:num_tokens].to(output.dtype)
         else:
             output[:num_tokens] = attn_out.reshape(num_tokens, -1).to(output.dtype)
+        return output
+
+    def _streaming_attention(self, layer, query, key, value, kv_cache, metadata, output):
+        from .kernels.streaming_attention import (
+            streaming_attention_ref,
+            streaming_attention_triton,
+        )
+
+        if (key is None) != (value is None):
+            raise ValueError("Both new K and V must be supplied together")
+        actual = min(query.shape[0], metadata.num_actual_tokens)
+        output.zero_()
+        if actual == 0:
+            return output
+        starts, seqs = metadata_batch_lists(metadata)
+        starts = [min(n, actual) for n in starts]
+        active = [i for i, (a, b) in enumerate(pairwise(starts)) if b > a]
+        fresh_only = [i for i in active if key is not None and seqs[i] == starts[i+1]-starts[i]]
+        cached = [i for i in active if i not in fresh_only]
+        # Preserve native prefix-free prefill even in mixed batches. It has no
+        # historical KV to materialize; only cached requests enter streaming.
+        result = self._prefill_attention(query, key, value, kv_cache, metadata, layer, request_indices=fresh_only) \
+            if fresh_only else None
+        if cached:
+            token_ids = None
+            q_input, k_input, v_input = query[:actual], None if key is None else key[:actual], None if value is None else value[:actual]
+            table = metadata.block_tables
+            if fresh_only:
+                token_ids = torch.tensor([t for i in cached for t in range(starts[i], starts[i+1])], device=query.device)
+                request_ids = torch.tensor(cached, device=table.device)
+                q_input = q_input[token_ids]
+                k_input = None if k_input is None else k_input[token_ids]
+                v_input = None if v_input is None else v_input[token_ids]
+                table = table[request_ids]
+                lengths = [starts[i+1]-starts[i] for i in cached]
+                starts = [0]
+                for length in lengths:
+                    starts.append(starts[-1] + length)
+                seqs = [seqs[i] for i in cached]
+            rk, rv = self._layer_rots(layer, query.device)
+            q = (q_input.float() @ rk).to(query.dtype)
+            k = None if k_input is None else (k_input.float() @ rk).to(query.dtype)
+            v = None if v_input is None else (v_input.float() @ rv).to(query.dtype)
+            stage = None
+            if self._oscar.window_enabled and self._oscar_stage_ready:
+                stage = (layer._oscar_stage_k, layer._oscar_stage_v, layer._oscar_slot_owner)
+            if query.device.type == "cpu":
+                rotated, _ = streaming_attention_ref(q, k, v, self.key_cache, self.value_cache,
+                                                     table, starts, seqs, self.scale, stage)
+            else:
+                if not self._oscar_use_triton:
+                    raise RuntimeError("Streaming NPU attention requires Triton; no dense-history fallback")
+                rotated, _ = streaming_attention_triton(q, k, v, self.key_cache, self.value_cache,
+                                                        table, starts, seqs, self.scale, stage,
+                                                        workspace_bytes=self._oscar.stream_workspace_bytes)
+            decoded = (rotated @ rv.t()).to(query.dtype)
+            if token_ids is None:
+                result = decoded
+            else:
+                result[token_ids] = decoded
+        if result is None:
+            return output
+        if output.ndim == 3:
+            output[:actual] = result[:actual]
+        else:
+            output[:actual] = result[:actual].reshape(actual, -1)
         return output
 
     # ------------------------------------------------------------------ decode
@@ -445,7 +524,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         # Ascend already provides cumulative query ends on the host. Clip out
         # dummy padding requests before repeat_interleave, whose size is fixed.
         qsl, seqs = metadata_batch_lists(attn_metadata)
-        lengths = [max(0, min(end, N) - min(start, N)) for start, end in zip(qsl, qsl[1:])]
+        lengths = [max(0, min(end, N) - min(start, N)) for start, end in pairwise(qsl)]
         req = torch.repeat_interleave(
             torch.arange(len(lengths), device=dev),
             torch.tensor(lengths, device=dev), output_size=N,

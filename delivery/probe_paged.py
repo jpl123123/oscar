@@ -116,6 +116,7 @@ def run(device, use_triton):
             impl.scale = d**-0.5
             impl.key_cache = impl.value_cache = None
             impl._oscar_setup()
+            impl._oscar.attention_mode = "native"  # explicit legacy paged experiment
             impl._oscar.use_paged = True
             impl._oscar_use_triton = True
             impl._oscar.window_enabled = True

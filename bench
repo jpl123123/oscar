@@ -2,4 +2,4 @@
 # Stop the model server first so it does not compete for the benchmark NPU.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${PYTHON:-python3}" "$REPO_ROOT/tools/benchmark_prep.py" "$@"
+exec "${PYTHON:-python3}" "$REPO_ROOT/tools/benchmark_streaming.py" "$@"
