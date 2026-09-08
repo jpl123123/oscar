@@ -332,11 +332,8 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         return output
 
     def _streaming_attention(self, layer, query, key, value, kv_cache, metadata, output):
-        from .kernels.streaming_attention import (
-            streaming_attention_ref,
-            streaming_attention_triton,
-            validate_npu_profile,
-        )
+        from .kernels.slab_attention import slab_attention
+        from .kernels.streaming_attention import validate_npu_profile
 
         if (key is None) != (value is None):
             raise ValueError("Both new K and V must be supplied together")
@@ -377,15 +374,11 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             stage = None
             if self._oscar.window_enabled and self._oscar_stage_ready:
                 stage = (layer._oscar_stage_k, layer._oscar_stage_v, layer._oscar_slot_owner)
-            if query.device.type == "cpu":
-                rotated, _ = streaming_attention_ref(q, k, v, self.key_cache, self.value_cache,
-                                                     table, starts, seqs, self.scale, stage)
-            else:
-                if not self._oscar_use_triton:
-                    raise RuntimeError("Streaming NPU attention requires Triton; no dense-history fallback")
-                rotated, _ = streaming_attention_triton(q, k, v, self.key_cache, self.value_cache,
-                                                        table, starts, seqs, self.scale, stage,
-                                                        workspace_bytes=self._oscar.stream_workspace_bytes)
+            if query.device.type != "cpu" and not self._oscar_use_triton:
+                raise RuntimeError("Streaming NPU attention requires Triton; no dense-history fallback")
+            rotated, _ = slab_attention(q, k, v, self.key_cache, self.value_cache,
+                                       table, starts, seqs, self.scale, stage,
+                                       workspace_bytes=self._oscar.stream_workspace_bytes)
             decoded = (rotated @ rv.t()).to(query.dtype)
             if token_ids is None:
                 result = decoded

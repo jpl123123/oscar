@@ -16,6 +16,7 @@ if triton is not None:
         Owner,
         Out,
         length,
+        source_start,
         stride_cb,
         stride_cp,
         stride_ch,
@@ -35,8 +36,9 @@ if triton is not None:
         pos = tl.program_id(0) * BT + tl.arange(0, BT)
         head = tl.program_id(1)
         valid = pos < length
-        block = tl.load(BlockTable + pos // BS, mask=valid, other=0).to(tl.int64)
-        offset = pos % BS
+        logical = source_start + pos
+        block = tl.load(BlockTable + logical // BS, mask=valid, other=0).to(tl.int64)
+        offset = logical % BS
         slot = block * stride_cb + offset.to(tl.int64) * stride_cp + head * stride_ch
         meta = (
             block * stride_mb
@@ -118,6 +120,7 @@ def prepare_native_kv(kc, vc, bt, prefix, k_new, v_new, stage=None, *, use_trito
             owner,
             out,
             prefix,
+            0,
             source.stride(0),
             source.stride(1),
             source.stride(2),

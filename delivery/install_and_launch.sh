@@ -226,7 +226,7 @@ if [ "$OSCAR_ASCEND_ATTENTION_MODE" == "streaming" ]; then
         || fail "Streaming 性能门禁失败 — 见 $LOG_DIR/streaming_bench_$STAMP.log"
     export OSCAR_ASCEND_USE_PAGED=0
     export OSCAR_ASCEND_FUSED_PREP=0
-    echo "  OSCAR 读取: 分块矩阵 attention；无完整历史 KV 临时张量"
+    echo "  OSCAR 读取: 固定容量 KV 块 + 原生 attention/LSE 归并；无随历史增长的浮点 KV 临时张量"
 elif [ "$OSCAR_ASCEND_ATTENTION_MODE" != "native" ]; then
     fail "OSCAR_ASCEND_ATTENTION_MODE 必须为 streaming 或 native"
 fi

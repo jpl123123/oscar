@@ -7,6 +7,7 @@ import torch
 
 from delivery.probe_streaming import kernel_cases
 from oscar_ascend.kernels import streaming_attention as stream
+from oscar_ascend.kernels.slab_attention import slab_attention
 
 
 def test_deployment_cases_match_verified_dtype_and_block_size():
@@ -38,6 +39,8 @@ def test_unverified_npu_profiles_fail_before_launch(dtype, bs, monkeypatch):
         stream.streaming_attention_triton(
             query, None, None, cache, cache, None, None, None, 0.0625
         )
+    with pytest.raises(ValueError, match="requires bf16 queries"):
+        slab_attention(query, None, None, cache, cache, None, None, None, 0.0625)
 
 
 def test_cpu_oracle_keeps_compatibility_coverage():

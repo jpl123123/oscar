@@ -11,7 +11,7 @@ import torch
 
 from delivery.benchmark_utils import compare_calls
 from delivery.probe_streaming import bootstrap, make_case, make_impl
-from oscar_ascend.kernels.streaming_attention import plan_stream
+from oscar_ascend.kernels.slab_attention import plan_slabs
 
 CASES = (
     ("mtp", 1, 24579, 4),
@@ -28,9 +28,11 @@ def benchmark_case(name, batch, prefix, count, device):
     case = make_case([prefix] * batch, [count] * batch)
     impl, layer, inputs = make_impl(case, device, "native")
     output = torch.empty_like(inputs[0])
-    plan = plan_stream(case[6], case[7], 6, 1, 256)
+    plan = plan_slabs(
+        batch, 1, 256, inputs[0].element_size(), impl._oscar.stream_workspace_bytes
+    )
     print(
-        f"STREAM BENCH plan: query_tiles={len(plan.tiles)} splits={plan.splits} "
+        f"STREAM BENCH plan: impl=native_slabs chunk_tokens={plan.chunk_tokens} "
         f"scratch_bytes={plan.scratch_bytes}; first calls then 6 warm rounds; "
         "each completion waits for device synchronization",
         flush=True,
@@ -65,7 +67,9 @@ def benchmark_case(name, batch, prefix, count, device):
         "q_len": count,
         "timings": timing,
         "baseline_over_streaming": baseline / streaming,
-        "streaming_split_scratch_bytes": plan.scratch_bytes,
+        "streaming_impl": "native_slabs",
+        "streaming_kv_scratch_bytes": plan.scratch_bytes,
+        "streaming_chunk_tokens": plan.chunk_tokens,
         "dense_history_pair_bytes": batch * prefix * 256 * 2 * 2,
         "memory_note": "calculated tensor sizes; not measured device peak",
         "scope": "same-input single-layer full forward; includes write/window/rotation; excludes model/communication",

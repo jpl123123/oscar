@@ -5,21 +5,21 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。目标BF16 query + 128-token kernel页已通过NPU数值和backend检查，但性能门禁失败：1/8请求MTP分别慢约2.11/2.21倍，长continuation约30.47秒/层，比旧OSCAR native对照慢约1000倍。此版本尚不能作为性能修复交付，一键入口会阻断服务。**
+**当前默认 streaming 已替换为 `native_slabs`：在固定容量的浮点 KV 工作区中按块解码历史，每块供整批 query 使用，再由 Ascend 原生 attention 和 FP32 LSE 归并得到完整结果。MTP、decode及有历史的continuation均使用这条路径；无历史prefill保留原生快路径。新版本本地数值和生命周期测试通过，NPU编译、数值及性能仍须通过一键门禁，尚无真机加速倍数。**
 
 当前NPU streaming部署限定BF16模型/query和`cache.shape[1]=128`。这不改变INT2的int8物理槽，也不改变分配器外层可能为1536的block布局。FP16 query、1536-token kernel页及两者组合属于独立兼容测试；组合配置曾触发编译器静态buffer形状错误，尚未修复。worker初始化和forward会拒绝未验证配置，避免把测试拆分误当作扩大支持范围。
 
-历史实测：原生融合读取曾使重复MTP步骤由约4.72秒降至0.556秒，但仍反复物化完整历史；后续KV准备融合未证明提速。该路径现在作为显式`native`对照保留。streaming为新的矩阵实现，不能沿用之前8.5倍的数字宣称自身收益。实现细节见 [streaming改造与验收](plan/IMPLEMENTATION-STREAMING-20260908.md)。
+历史实测：原生融合读取曾使重复MTP步骤由约4.72秒降至0.556秒，但仍反复物化完整历史。随后直接Triton streaming实测MTP慢约2.1倍、长continuation慢约1000倍；那条小矩阵循环已退出默认backend。此次改造不能沿用任何历史加速数字。当前实现见 [固定容量KV块改造与验收](plan/IMPLEMENTATION-NATIVE-SLABS-20260908.md)，失败过程保留在 [直接streaming记录](plan/IMPLEMENTATION-STREAMING-20260908.md)。
 
 ## 本轮变化
 
 - 修复窗口每步清空、负 slot 写坏尾部缓存、CPU seq metadata 误用、decode 异常回退、类替换失败未恢复以及多 KV head 的几何检查。
 - sink/recent 保留未量化数据，写入时旋转到 FP32 空间；避免历史 KV 反复逆旋转。窗口现在跨步保留，哈希碰撞选择同一个 owner/value 写入者，非窗口重写会使旧 tag 失效。
-- 默认按32个KV token、64个通道的小块解码，在一组query/head之间共享并用`tl.dot`计算，在线softmax归并；不生成随历史长度增长的全局dense KV。
+- 默认每请求每块最多8192个历史token；多请求共享不超过32 MiB的K/V缓冲，容量不随历史增长。同一历史块供全部query复用，使用原生TND attention及LSE归并，避免按query小块重复解码。
 - cache-only decode、混合请求和有历史的长continuation都走新路径；混批中的无历史prefill单独使用原生attention，保留当前chunk的未量化语义。
 - standalone KV update会立即使被重写位置的staging标签失效，防止cache-only读取旧窗口值。MTP拒绝后的尾部重写、block回收和padding有回归覆盖。
-- staging在槽编号可由FP32精确表示时使用浮点稳定排序。streaming门禁覆盖实际128-token kernel页、24K前缀和16/32/64请求；其他dtype/页大小通过`probe_streaming.py --compat`分别研究，不参与默认生产验收。
-- MTP BF16影子池、FP32窗口、旋转矩阵继续计入常驻预算；新split暂存和本步query变换的保守临时预留按worker计入预算，不按层复制大工作区。
+- staging在槽编号可由FP32精确表示时使用浮点稳定排序。新门禁含20个用例，覆盖实际128-token kernel页、24K前缀、跨8192-token块的continuation、16/32/64请求及cache-only因果边界；其他dtype/页大小仍由旧直接内核的独立兼容入口研究，不参与默认生产验收。
+- MTP BF16影子池、FP32窗口、旋转矩阵继续计入常驻预算；KV块、LSE归并、当前query变换和共享因果mask的保守预留按worker计入预算，不按层复制。目标15360调度token/Hq6/Hk1/D256约457 MiB/worker，不是同等大小的常驻BF16历史副本。
 - 启动 READY manifest 按 TP rank 检查 FULL 层覆盖和源码指纹。安装器默认重装当前 checkout 的 editable 包，避免复用旧 wheel。
 - probe 显式拒绝 NaN/Inf。新内核有独立跨页、多请求和空段 NPU 门禁。
 
@@ -75,7 +75,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
 
-停服务后运行`./bench`，现在比较native完整历史对照和新的streaming路径，包括1/8请求MTP及continuation。输出`STREAM BENCH`中的首次调用、6次交错采样、中位数和`baseline_over_streaming`；>1表示新路径更快。每次预热采样开始和完成都会打印，日志不再只停留在首次调用。独立`./bench`仍收集全部用例；`./bench --gate`则在首个性能失败后停止，当前版本建议用后者避免重复等待长continuation。暂存字节是计算量，不是设备峰值。旧KV准备融合的A/B工具仍在`tools/benchmark_prep.py`。工具不启动服务、不切换默认值。
+停服务后运行`./bench`，比较native完整历史对照和新的streaming路径，包括1/8请求MTP及continuation。日志应出现`impl=native_slabs`；JSON包含首次调用、6次交错采样、中位数、`streaming_kv_scratch_bytes`和`baseline_over_streaming`（>1表示新路径更快）。每次预热采样开始和完成都会打印。独立`./bench`收集全部用例；`./bench --gate`在首个性能失败后停止。暂存字节是计算量，不是设备峰值。旧KV准备融合的A/B工具仍在`tools/benchmark_prep.py`。工具不启动服务、不切换默认值。
 
 服务仍慢时，先停旧服务，再采集一次有界诊断：
 
@@ -85,7 +85,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 ```
 
-只计时rank 0前6个非空调度步骤及其采样，输出真实forward的加载路径/代码指纹、形状/开关、各OSCAR阶段耗时、整数sort调用栈。`inclusive_ms`包含嵌套阶段，不能相加；`wait_before_ms`记录进入该阶段前等待已提交设备任务的时间。同步和Python算子追踪会改变这几个步骤的吞吐，首轮也可能包含JIT，不能把诊断吞吐当作正式benchmark。默认关闭；达到步数后自动停止采集，不修改计算结果。
+只计时rank 0前6个非空调度步骤及其采样，输出真实forward的加载路径/代码指纹、形状/开关、各OSCAR阶段耗时、整数sort调用栈。新路径额外显示`slab_dequant`、`slab_native_attention`、`slab_merge`。`inclusive_ms`包含嵌套阶段，不能相加；`wait_before_ms`记录进入该阶段前等待已提交设备任务的时间。同步和Python算子追踪会改变这几个步骤的吞吐，首轮也可能包含JIT，不能把诊断吞吐当作正式benchmark。默认关闭；达到步数后自动停止采集，不修改计算结果。
 
 并发诊断用 `./load`：同样安装、检查并启动服务，等待rank 0出现至少8个正调度请求、每请求最多4个token的步骤，只采集4个匹配步骤及其采样。用原有客户端发起32并发负载；它不会自动发送请求。不匹配的prefill/单请求步骤不消耗采样次数，日志会显示 `PERF waiting`。PERF的batch字段给出实际调度请求数及token数；不要用APIServer的Running数代替单步实际调度数。
 
@@ -98,7 +98,7 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 | `OSCAR_ASCEND_PACKED` | serve默认1；0使用BF16物理槽几何 |
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
 | `OSCAR_ASCEND_ATTENTION_MODE` | 默认streaming；native显式启用原完整历史对照。streaming在NPU要求Triton，不提供dense fallback |
-| `OSCAR_ASCEND_STREAM_WORKSPACE_MIB` | 默认32，仅限制split暂存；0使用单split。查询输入/输出和变换临时量另作worker预留，不代表整模型峰值上限 |
+| `OSCAR_ASCEND_STREAM_WORKSPACE_MIB` | 默认32，限制所有请求共用的浮点K/V块缓冲。查询输出、LSE和变换临时量另作worker预留；新实现拒绝0，不会退回旧的慢速小矩阵内核。此值不代表整模型峰值上限 |
 | `OSCAR_ASCEND_USE_PAGED` | 仅native对照模式下有效；默认0，1启用旧向量paged实验 |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |

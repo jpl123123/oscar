@@ -33,17 +33,31 @@ def source_fingerprint():
 
 
 def streaming_reserve(impls, max_tokens):
-    """Reserve one worker's peak query/split work, not a BF16 history cache."""
+    """One worker's bounded KV slabs, query/merge work and shared causal mask."""
+    from .kernels.slab_attention import plan_slabs
+
     active = [impl for impl in impls if impl._oscar.attention_mode == "streaming"]
     if not active:
         return 0
     if max_tokens <= 0:
         raise ValueError("Streaming reserve requires max_num_batched_tokens")
+    for impl in active:
+        plan_slabs(
+            1,
+            impl.num_kv_heads,
+            impl.head_size,
+            workspace_bytes=impl._oscar.stream_workspace_bytes,
+        )
     # Conservative allowance for rotated current tensors, output/inverse
     # rotation, and current-KV write temporaries. These scale with query work.
     return max(
         impl._oscar.stream_workspace_bytes
-        + max_tokens * impl.head_size * 4 * (3 * impl.num_heads + 4 * impl.num_kv_heads)
+        + 2048 * 2048
+        + max_tokens
+        * (
+            impl.head_size * 4 * (4 * impl.num_heads + 4 * impl.num_kv_heads)
+            + 3 * impl.num_heads * 4
+        )
         for impl in active
     )
 

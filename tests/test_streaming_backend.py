@@ -172,7 +172,7 @@ def test_streaming_is_default_and_transient_reserve_is_per_worker(monkeypatch):
 
 
 def test_mixed_prefix_free_prefill_does_not_force_it_into_streaming(monkeypatch):
-    from oscar_ascend.kernels import streaming_attention as stream
+    from oscar_ascend.kernels import slab_attention as stream
 
     impl, layer, cache = fixture()
     impl._oscar.attention_mode = "streaming"
@@ -191,13 +191,13 @@ def test_mixed_prefix_free_prefill_does_not_force_it_into_streaming(monkeypatch)
     )
     forbid_dense(monkeypatch, impl)
     calls = []
-    original = stream.streaming_attention_ref
+    original = stream.slab_attention
 
     def checked(q, k, v, *args, **kwargs):
         calls.append(q.shape[0])
         return original(q, k, v, *args, **kwargs)
 
-    monkeypatch.setattr(stream, "streaming_attention_ref", checked)
+    monkeypatch.setattr(stream, "slab_attention", checked)
     result = impl.forward(
         layer, q, current, current, cache, md, output=torch.empty_like(q)
     )
@@ -206,7 +206,7 @@ def test_mixed_prefix_free_prefill_does_not_force_it_into_streaming(monkeypatch)
 
 
 def test_streaming_failure_has_no_dense_fallback(monkeypatch):
-    from oscar_ascend.kernels import streaming_attention as stream
+    from oscar_ascend.kernels import slab_attention as stream
 
     impl, layer, cache = fixture()
     impl._oscar.attention_mode = "streaming"
@@ -218,7 +218,7 @@ def test_streaming_failure_has_no_dense_fallback(monkeypatch):
     def failed(*args, **kwargs):
         raise RuntimeError("stream failure")
 
-    monkeypatch.setattr(stream, "streaming_attention_ref", failed)
+    monkeypatch.setattr(stream, "slab_attention", failed)
     with pytest.raises(RuntimeError, match="stream failure"):
         impl.forward(
             layer,

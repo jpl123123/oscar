@@ -1,4 +1,4 @@
-"""No-dense-history gate: matrix kernel, long/mixed requests and real backend."""
+"""Bounded KV slabs + native attention: numerics, lifecycle and real backend."""
 
 import argparse
 import math
@@ -10,9 +10,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
+from oscar_ascend.kernels.slab_attention import plan_slabs, slab_attention
 from oscar_ascend.kernels.store_kernel import oscar_store_ref
 from oscar_ascend.kernels.streaming_attention import (
-    plan_stream,
     streaming_attention_ref,
     streaming_attention_triton,
 )
@@ -108,11 +108,13 @@ def kernel_cases(compatibility=None):
     return [
         ("mixed", [0, 129, 1025, 0], [1, 4, 3, 0], {}),
         ("batch32", [128 + i % 3 for i in range(32)], [4] * 32, {}),
-        ("batch16_split8", [129] * 16, [4] * 16, {}),
-        ("batch64_split2", [129] * 64, [4] * 64, {}),
-        ("single_split_prefill", [129], [1024], {}),
+        ("batch16", [129] * 16, [4] * 16, {}),
+        ("batch64", [129] * 64, [4] * 64, {}),
+        ("cached_prefill", [129], [1024], {}),
         ("long_24k", [24579], [4], {}),
         ("cache_only_empty", [0, 257], [1, 1], {"fresh": False}),
+        ("cache_only_multi", [3, 263], [7, 9], {"fresh": False}),
+        ("slab_boundary_prefill", [8193], [257], {}),
         ("multi_kv_legacy", [129], [7], {"hk": 2, "cache_dtype": torch.bfloat16}),
     ]
 
@@ -130,26 +132,24 @@ def check_kernel(device, compatibility=None):
             case = make_case(prefixes, lengths, window=window, **options)
             expected, expected_lse = streaming_attention_ref(*case)
             args = to_device(case, device)
-            if device == "npu":
+            if compatibility is not None and device == "npu":
                 actual, lse = streaming_attention_triton(
-                    *args, experimental_profile=compatibility is not None
+                    *args, experimental_profile=True
                 )
             else:
-                # Different tile boundaries exercise online-softmax associativity.
-                actual, lse = streaming_attention_ref(*args, kv_tile=47, query_tile=17)
+                actual, lse = slab_attention(*args)
             torch.testing.assert_close(actual.cpu(), expected, atol=5e-3, rtol=5e-3)
             torch.testing.assert_close(lse.cpu(), expected_lse, atol=3e-3, rtol=3e-3)
-            plan = plan_stream(
-                case[6],
-                case[7],
-                case[0].shape[1],
+            plan = plan_slabs(
+                sum(b > a for a, b in zip(case[6], case[6][1:])),
                 case[3].shape[2],
                 256,
-                has_new=case[1] is not None,
+                case[0].element_size(),
             )
             print(
                 f"STREAM {'COMPAT PASS' if compatibility is not None else 'PASS'} device={device} case={name} window={window} "
-                f"splits={plan.splits} scratch_bytes={plan.scratch_bytes}",
+                f"impl={'experimental_direct' if compatibility is not None else 'native_slabs'} "
+                f"chunk_tokens={plan.chunk_tokens} scratch_bytes={plan.scratch_bytes}",
                 flush=True,
             )
 
@@ -291,7 +291,7 @@ def main():
     if args.compat is None:
         check_backend(args.device)
         print(
-            f"STREAM DEPLOYMENT PASS device={args.device} query_dtype=bf16 kernel_block_size=128",
+            f"STREAM DEPLOYMENT PASS device={args.device} impl=native_slabs query_dtype=bf16 kernel_block_size=128",
             flush=True,
         )
 

@@ -1,5 +1,7 @@
 # 移除每步完整历史KV物化：streaming实现记录
 
+**历史记录：以下直接Triton小矩阵实现已退出默认backend。当前修复为固定容量KV块配合原生attention，见 [native_slabs改造](IMPLEMENTATION-NATIVE-SLABS-20260908.md)。下面的split预算、内核布局及性能结果均对应旧实现，保留用于解释改造原因。**
+
 本次是计算路径改造，不再以调整KV准备小内核作为主要修复。本地没有NPU；用户11:19开始的复测已确认实际BF16/128配置的16个内核case及backend通过，但三个性能用例全部失败，长continuation甚至比旧OSCAR native对照慢约1000倍。结构上消除了全历史浮点临时张量，性能目标仍未完成。
 
 ## 改了什么
