@@ -14,6 +14,7 @@ import torch
 from oscar_ascend.kernels.paged_attention import (
     oscar_paged_attention_ref,
     oscar_paged_attention_triton,
+    paged_block_kv,
 )
 from oscar_ascend.kernels.store_kernel import oscar_store_ref, oscar_store_triton
 
@@ -165,6 +166,63 @@ def run(device, use_triton):
             torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
         print(
             f"PAGED PASS device={device} triton={use_triton} dtype={dtype} q_len=1/4/2 prefix=0/129/257"
+        )
+    check_long_context(device, use_triton)
+
+
+def check_long_context(device, use_triton):
+    # Actual packed serving uses 1536-token pages. Include tile/page tails,
+    # long split loops, GQA, and staging hits/misses absent from the tiny probe.
+    torch.manual_seed(91)
+    d, hk, hq, bs, prefix, nq = 256, 1, 16, 1536, 16387, 4
+    blocks = (prefix + nq + bs - 1) // bs
+    bt = torch.arange(blocks - 1, -1, -1, dtype=torch.int32).unsqueeze(0)
+    pos = torch.arange(prefix)
+    slots = bt[0, pos // bs].long() * bs + pos % bs
+    oldk, oldv = [torch.randn(prefix, hk, d) for _ in range(2)]
+    q, k, v = [torch.randn(nq, h, d) for h in (hq, hk, hk)]
+    owner = torch.full((3, bs), -1, dtype=torch.int64)
+    sk = torch.zeros(3, bs, hk, d)
+    sv = torch.zeros_like(sk)
+    tail = slots[-256:]
+    rows, offsets = tail // bs % 3, tail % bs
+    owner[rows, offsets] = tail // bs
+    sk[rows, offsets], sv[rows, offsets] = oldk[-256:], oldv[-256:]
+    for dtype in (torch.bfloat16, torch.int8):
+        kc = torch.zeros(blocks, bs, hk, d, dtype=dtype)
+        vc = torch.zeros_like(kc)
+        oscar_store_ref(oldk, oldv, kc, vc, slots)
+        tensors = [t.to(device) for t in (q, k, v, kc, vc, bt)]
+        for stage in (None, (sk, sv, owner)):
+            expected = oscar_paged_attention_ref(
+                q,
+                k,
+                v,
+                kc,
+                vc,
+                bt,
+                [0, nq],
+                [prefix + nq],
+                d**-0.5,
+                stage,
+            )
+            if use_triton:
+                stage_dev = (
+                    None if stage is None else tuple(t.to(device) for t in stage)
+                )
+                actual = oscar_paged_attention_triton(
+                    *tensors,
+                    [0, nq],
+                    [prefix + nq],
+                    d**-0.5,
+                    stage_dev,
+                ).cpu()
+                torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+            assert torch.isfinite(expected).all()
+        print(
+            f"PAGED LONG PASS device={device} triton={use_triton} dtype={dtype} "
+            f"prefix={prefix} block_size={bs} block_kv={paged_block_kv()}",
+            flush=True,
         )
 
 

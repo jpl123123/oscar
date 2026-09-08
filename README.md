@@ -5,14 +5,15 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前版本 0.2.0：正确性修复与性能优化已实现，CPU 回归通过；新 Triton 内核和 worker 接缝尚待 NPU 验证。不能将 CPU PASS 或 ACTIVE 判定视为精度、吞吐、峰值显存验收。**
+**当前版本 0.2.0：用户已通过基础 NPU 数值门禁并成功启动，但服务日志显示严重性能退化。本轮新增原生融合 prefill、staging 排序优化及 paged 分块调整；CPU 回归通过，改动仍待 NPU 数值与性能复验。不能将 CPU PASS 或 ACTIVE 判定视为吞吐验收。**
 
 ## 本轮变化
 
 - 修复窗口每步清空、负 slot 写坏尾部缓存、CPU seq metadata 误用、decode 异常回退、类替换失败未恢复以及多 KV head 的几何检查。
 - sink/recent 保留未量化数据，写入时旋转到 FP32 空间；避免历史 KV 反复逆旋转。窗口现在跨步保留，哈希碰撞选择同一个 owner/value 写入者，非窗口重写会使旧 tag 失效。
 - 新增 MTP 多 query 分页 Triton attention：直接从 INT2 历史缓存读取，当前 chunk 使用未量化 K/V，窗口按 owner tag 覆盖。每请求 q_len≤16 时可走此路径；混合批次中的长 prefill 单独走 dense 路径。
-- dense continuation 也在旋转域计算，只对新 Q/K/V 和最终输出旋转；它仍然会物化历史 KV，并非 fused attention。
+- dense continuation 在旋转域计算，只对新 Q/K/V 和最终输出旋转；NPU 使用原生融合注意力，仍会物化历史 KV。CPU 保留 SDPA oracle。
+- staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；paged KV 分块从4改为32，启动门禁增加16K前缀与真实1536-token页。
 - MTP BF16 影子池、FP32 窗口、旋转矩阵纳入常驻内存预算，并在缓存初始化时分配、检查。临时算子的峰值内存仍需 NPU 压测。
 - 启动 READY manifest 按 TP rank 检查 FULL 层覆盖和源码指纹。安装器默认重装当前 checkout 的 editable 包，避免复用旧 wheel。
 - probe 显式拒绝 NaN/Inf。新内核有独立跨页、多请求和空段 NPU 门禁。
@@ -29,7 +30,7 @@ python3 -m venv .venv
 .venv/bin/python delivery/probe_paged.py --device cpu
 ```
 
-本轮执行：原有数值镜像17项通过，backend回归23项通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮执行：backend/prefill/版本/类型回归48项通过，新增prefill因果与16K分页CPU镜像通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
@@ -43,6 +44,7 @@ python3 -m pip install --no-deps --no-build-isolation -e .
 
 # 新内核独立门禁（不会向外部服务发请求）
 python3 delivery/probe_paged.py --device npu --triton
+python3 delivery/probe_prefill.py --device npu
 
 # 一键：环境/版本检查、安装、校准、数值门禁，再前台启动服务
 bash delivery/install_and_launch.sh
@@ -60,6 +62,9 @@ bash delivery/check_oscar_active.sh /tmp/oscar_ascend_logs/serve.log
 
 # attention单层微基准；先通过paged probe。不是端到端吞吐测试。
 python3 tools/benchmark_attention.py --device npu --triton --lengths 1024 8192 32768
+
+# 15360-token长prefill：旧SDPA与原生融合注意力（先停服务，避免争抢NPU）
+python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-tokens 15360 --iterations 3
 ```
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
@@ -73,6 +78,7 @@ python3 tools/benchmark_attention.py --device npu --triton --lengths 1024 8192 3
 | `OSCAR_ASCEND_PACKED` | serve默认1；0使用BF16物理槽几何 |
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
 | `OSCAR_ASCEND_USE_PAGED` | 插件默认0；一键paged门禁通过后设为1；每请求q_len≤16使用新内核 |
+| `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认32；允许4/16/32/64/128；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | serve默认仓库内 `oscar_rotations.pt`；启动缓存初始化时检查目标层覆盖和正交性 |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | serve默认0.96/0.92；插件直接加载时默认0，范围[0,1] |

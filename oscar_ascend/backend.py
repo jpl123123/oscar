@@ -13,9 +13,10 @@ import torch
 
 from .config import OscarAscendConfig
 from .format import K_IDX_OFF, VALUES_PER_BYTE, check_d
-from .kernels.decode_kernel import oscar_decode_ref, oscar_prefill_ref
+from .kernels.decode_kernel import oscar_decode_ref
 from .kernels.dequant_kernel import oscar_full_dequant
 from .kernels.dequant_kernel import triton as _k_triton
+from .kernels.prefill import oscar_prefill
 from .kernels.store_kernel import oscar_store_ref
 from .rotation import get_layer_rotation
 
@@ -80,6 +81,14 @@ def _load_attention_types():
 
 
 AscendAttentionBackendImpl, AscendAttentionState = _load_attention_types()
+
+
+def staging_order(seats, capacity):
+    # Seats are bounded by the arena, not by physical cache block IDs.
+    # Every integer below 2**24 is exact in fp32. Ascend integer argsort
+    # falls back to AiCPU; retain int64 for exceptionally large arenas.
+    keys = seats.float() if capacity <= 2**24 else seats
+    return torch.argsort(keys, stable=True)
 
 
 class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: ignore[misc]
@@ -361,7 +370,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
             v_seq = value[q_start:q_end]
             cached_len = seq_len - q_len
             if cached_len <= 0:
-                out = oscar_prefill_ref(
+                out = oscar_prefill(
                     q_seq, k_seq, v_seq,
                     torch.zeros(0, Hk, D, device=query.device),
                     torch.zeros(0, Hk, D, device=query.device),
@@ -378,7 +387,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                     k_cached, v_cached = self._stage_splice(
                         layer, bt_row, cached_len, k_cached, v_cached
                     )
-                out = oscar_prefill_ref(
+                out = oscar_prefill(
                     (q_seq.float() @ rk).to(query.dtype), (k_seq.float() @ rk).to(query.dtype),
                     (v_seq.float() @ rv).to(query.dtype), k_cached.to(query.dtype), v_cached.to(query.dtype),
                     self.scale, Hk, D,
@@ -433,7 +442,7 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         # Hash collisions: choose one deterministic writer per seat. Owners and
         # values must come from the SAME token, including invalidating non-window
         # writes after a physical block is recycled or a draft token is rejected.
-        order = torch.argsort(seats, stable=True)
+        order = staging_order(seats, layer._oscar_stage_rows * bs)
         sorted_seats = seats[order]
         last = torch.cat([sorted_seats[1:] != sorted_seats[:-1],
                           torch.ones(min(1, sorted_seats.numel()), device=dev, dtype=torch.bool)])

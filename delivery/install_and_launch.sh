@@ -216,6 +216,11 @@ else
 fi
 
 # Multi-query kernel is gated separately: existing decode probes do not cover MTP.
+if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
+    "$PYTHON" delivery/probe_prefill.py --device npu \
+        || fail "原生融合 prefill probe FAIL — 拒绝 serve"
+fi
+
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ] && [ "${OSCAR_ASCEND_USE_TRITON:-1}" == "1" ] && [ "${OSCAR_ASCEND_USE_PAGED:-auto}" != "0" ]; then
     if "$PYTHON" delivery/probe_paged.py --device npu --triton; then
         export OSCAR_ASCEND_USE_PAGED=1

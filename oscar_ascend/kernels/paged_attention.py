@@ -8,6 +8,7 @@ split reducer. No dense historical K/V allocation or inverse rotation.
 from __future__ import annotations
 
 import itertools
+import os
 
 import torch
 
@@ -259,9 +260,21 @@ if triton is not None:
         tl.store(Mid_o_ptr + out_base + HEAD_DIM, m_prev + tl.log(safe_l))
 
 
-def oscar_paged_attention_triton(q, k, v, kc, vc, bt, qsl, seqs, scale, stage=None):
+def paged_block_kv():
+    value = int(os.environ.get("OSCAR_ASCEND_PAGED_BLOCK_KV", "32"))
+    if value not in (4, 16, 32, 64, 128):
+        raise ValueError("OSCAR_ASCEND_PAGED_BLOCK_KV must be 4, 16, 32, 64 or 128")
+    return value
+
+
+def oscar_paged_attention_triton(
+    q, k, v, kc, vc, bt, qsl, seqs, scale, stage=None, *, block_kv=None
+):
     if triton is None:
         raise RuntimeError("Triton is unavailable")
+    block_kv = paged_block_kv() if block_kv is None else block_kv
+    if block_kv not in (4, 16, 32, 64, 128):
+        raise ValueError("Unsupported paged KV tile size")
     from .decode_kernel import _oscar_decode_stage2
 
     n, hq, d = q.shape
@@ -319,7 +332,7 @@ def oscar_paged_attention_triton(q, k, v, kc, vc, bt, qsl, seqs, scale, stage=No
         ATTN_SCALE=scale,
         K_IDX_OFF=K_IDX_OFF,
         BLOCK_D=triton.next_power_of_2(d),
-        BLOCK_KV=4,
+        BLOCK_KV=block_kv,
         num_warps=1,
         num_stages=1,
     )

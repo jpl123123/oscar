@@ -445,3 +445,21 @@ def test_cpu_attention_states_only_when_both_packages_absent(monkeypatch):
     base, state = backend._load_attention_types()
     assert base is object
     assert state.ChunkedPrefill != state.DecodeOnly
+
+
+@pytest.mark.parametrize("capacity", [8192, 2**24, 2**24 + 2])
+def test_staging_sort_exact_and_stable_at_float32_boundary(monkeypatch, capacity):
+    from oscar_ascend.backend import staging_order
+
+    seats = torch.tensor([capacity - 1, 0, capacity - 2, capacity - 1, 0])
+    original = torch.argsort
+    expected = original(seats, stable=True)
+    seen = []
+
+    def checked(keys, **kwargs):
+        seen.append(keys.dtype)
+        return original(keys, **kwargs)
+
+    monkeypatch.setattr(torch, "argsort", checked)
+    assert torch.equal(staging_order(seats, capacity), expected)
+    assert seen == [torch.float32 if capacity <= 2**24 else torch.int64]
