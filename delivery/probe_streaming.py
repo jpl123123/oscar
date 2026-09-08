@@ -97,8 +97,15 @@ def to_device(case, device):
     )
 
 
-def check_kernel(device):
-    cases = [
+def kernel_cases(compatibility=None):
+    if compatibility is not None:
+        options = {
+            "fp16": {"dtype": torch.float16},
+            "large-page": {"bs": 1536},
+            "fp16-large-page": {"bs": 1536, "dtype": torch.float16},
+        }
+        return [(compatibility, [1537], [4], options[compatibility])]
+    return [
         ("mixed", [0, 129, 1025, 0], [1, 4, 3, 0], {}),
         ("batch32", [128 + i % 3 for i in range(32)], [4] * 32, {}),
         ("batch16_split8", [129] * 16, [4] * 16, {}),
@@ -107,15 +114,26 @@ def check_kernel(device):
         ("long_24k", [24579], [4], {}),
         ("cache_only_empty", [0, 257], [1, 1], {"fresh": False}),
         ("multi_kv_legacy", [129], [7], {"hk": 2, "cache_dtype": torch.bfloat16}),
-        ("large_page_fp16", [1537], [4], {"bs": 1536, "dtype": torch.float16}),
     ]
+
+
+def check_kernel(device, compatibility=None):
+    cases = kernel_cases(compatibility)
     for name, prefixes, lengths, options in cases:
         for window in (False, True):
+            print(
+                f"STREAM RUN device={device} case={name} window={window} "
+                f"dtype={options.get('dtype', torch.bfloat16)} block_size={options.get('bs', 128)} "
+                f"compatibility={compatibility is not None}",
+                flush=True,
+            )
             case = make_case(prefixes, lengths, window=window, **options)
             expected, expected_lse = streaming_attention_ref(*case)
             args = to_device(case, device)
             if device == "npu":
-                actual, lse = streaming_attention_triton(*args)
+                actual, lse = streaming_attention_triton(
+                    *args, experimental_profile=compatibility is not None
+                )
             else:
                 # Different tile boundaries exercise online-softmax associativity.
                 actual, lse = streaming_attention_ref(*args, kv_tile=47, query_tile=17)
@@ -130,7 +148,7 @@ def check_kernel(device):
                 has_new=case[1] is not None,
             )
             print(
-                f"STREAM PASS device={device} case={name} window={window} "
+                f"STREAM {'COMPAT PASS' if compatibility is not None else 'PASS'} device={device} case={name} window={window} "
                 f"splits={plan.splits} scratch_bytes={plan.scratch_bytes}",
                 flush=True,
             )
@@ -261,11 +279,21 @@ def check_backend(device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", choices=["cpu", "npu"], default="npu")
+    ap.add_argument(
+        "--compat",
+        choices=["fp16", "large-page", "fp16-large-page"],
+        help="Run one experimental profile independently; does not enable serving support",
+    )
     args = ap.parse_args()
     torch.set_num_threads(2)
     bootstrap(args.device)
-    check_kernel(args.device)
-    check_backend(args.device)
+    check_kernel(args.device, args.compat)
+    if args.compat is None:
+        check_backend(args.device)
+        print(
+            f"STREAM DEPLOYMENT PASS device={args.device} query_dtype=bf16 kernel_block_size=128",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

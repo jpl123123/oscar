@@ -1,6 +1,6 @@
 # 移除每步完整历史KV物化：streaming实现记录
 
-本次是计算路径改造，不再以调整KV准备小内核作为主要修复。当前本地没有NPU，新代码尚不能宣称已通过Ascend编译或已获得端到端加速。
+本次是计算路径改造，不再以调整KV准备小内核作为主要修复。本地没有NPU；用户后续已确认实际BF16/128配置的16个内核case通过，但尚无完整backend及性能门禁结果，不能宣称已获得端到端加速。
 
 ## 改了什么
 
@@ -62,7 +62,7 @@ FP32 softmax统计配合bf16/fp16矩阵乘法的累加/舍入顺序与原生融�
 
 ## NPU门禁与运行
 
-`delivery/probe_streaming.py --device npu`验证：混合query、16/32/64请求、单split长query、24K历史、空cache-only、legacy/packed槽、Hk2、fp16/bf16、窗口开关、真实backend及standalone更新。没有本地NPU，这些case仍需在目标机器运行。
+`delivery/probe_streaming.py --device npu`验证实际BF16 query/128-token kernel页：混合query、16/32/64请求、单split长query、24K历史、空cache-only、legacy/packed槽、Hk2、窗口开关、真实backend及standalone更新。BF16指query dtype，不要求把INT2存储改成BF16。
 
 `./bench`现在比较native对照和streaming，使用同输入交错测量三个实际形状：
 
@@ -80,3 +80,19 @@ git pull
 `./diag`会执行上述门禁再启动服务并采集前6步。若需要单独检查性能，停服务后运行`./bench`。显式`OSCAR_ASCEND_ATTENTION_MODE=native`可运行历史对照，但它仍有原来的全历史物化，不属于修复路径。
 
 在NPU编译、数值、真实形状性能和完整同样本LongBench评测完成前，只能确认结构性实现与本地回归，不报告新增加速倍数。
+
+## 10:45复测：部署内核通过，额外兼容组合编译失败
+
+用户日志确认前8组×窗口开关共16个case在NPU通过，包括24K、16/32/64请求、cache-only及Hk2 legacy槽。随后`large_page_fp16`的第一个window=False用例编译报`Failed to obtain op buffer shape size which should be static`。该用例同时改变query dtype和kernel页大小，不能从当前错误判断究竟是哪一项触发，也没有UB溢出的明确日志。
+
+用户实际服务PERF此前为query bf16、cache shape=[11772,128,1,256]。此次修正没有改动三个JIT计算函数，而是把默认门禁明确限定到这份部署配置；其他组合拆成独立研究入口：
+
+```bash
+python3 delivery/probe_streaming.py --device npu --compat fp16
+python3 delivery/probe_streaming.py --device npu --compat large-page
+python3 delivery/probe_streaming.py --device npu --compat fp16-large-page
+```
+
+这些命令分别固定另一轴以便定位，只输出COMPAT结果，不会启用服务支持。对应编译器问题仍未解决，不计为PASS。默认门禁保留全部16个已验证内核case并继续执行真实backend及性能门禁。
+
+worker缓存初始化、backend入口和公共Triton调用均检查NPU query/model dtype及实际kernel block size；未验证配置会明确失败，不转换精度、不修改缓存几何、不回退完整历史物化。只有独立兼容probe可显式放行实验profile。106项本地pytest与默认CPU门禁通过，JIT函数AST与上一个提交一致。

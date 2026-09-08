@@ -335,10 +335,12 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
         from .kernels.streaming_attention import (
             streaming_attention_ref,
             streaming_attention_triton,
+            validate_npu_profile,
         )
 
         if (key is None) != (value is None):
             raise ValueError("Both new K and V must be supplied together")
+        validate_npu_profile(query.dtype, self.key_cache.shape[1], device_type=query.device.type)
         actual = min(query.shape[0], metadata.num_actual_tokens)
         output.zero_()
         if actual == 0:

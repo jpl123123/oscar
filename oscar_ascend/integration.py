@@ -164,6 +164,14 @@ def install_runner_hooks():
             impl = getattr(module, "impl", None)
             if hasattr(impl, "_oscar_cfg"):
                 cache = caches[name]
+                if impl._oscar.attention_mode == "streaming":
+                    from .kernels.streaming_attention import validate_npu_profile
+
+                    validate_npu_profile(
+                        getattr(runner.model_config, "dtype", None),
+                        cache[0].shape[1],
+                        device_type=cache[0].device.type,
+                    )
                 impl._set_caches(cache)
                 impl._layer_rots(module, cache[0].device)
                 persistent += 4 * impl.head_size**2 * 4

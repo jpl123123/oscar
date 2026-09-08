@@ -5,7 +5,9 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。新内核已通过CPU数学/索引/生命周期回归，尚待目标NPU编译、数值和性能门禁验收。**
+**当前代码默认使用 streaming 分块矩阵 attention：有历史的MTP、decode和continuation直接按小块读取INT2页，不再生成完整历史K/V临时张量。无历史prefill保留原生快路径。目标BF16 query + 128-token kernel页已在NPU通过16个内核case；真实backend及性能门禁仍需完整通过。**
+
+当前NPU streaming部署限定BF16模型/query和`cache.shape[1]=128`。这不改变INT2的int8物理槽，也不改变分配器外层可能为1536的block布局。FP16 query、1536-token kernel页及两者组合属于独立兼容测试；组合配置曾触发编译器静态buffer形状错误，尚未修复。worker初始化和forward会拒绝未验证配置，避免把测试拆分误当作扩大支持范围。
 
 历史实测：原生融合读取曾使重复MTP步骤由约4.72秒降至0.556秒，但仍反复物化完整历史；后续KV准备融合未证明提速。该路径现在作为显式`native`对照保留。streaming为新的矩阵实现，不能沿用之前8.5倍的数字宣称自身收益。实现细节见 [streaming改造与验收](plan/IMPLEMENTATION-STREAMING-20260908.md)。
 
@@ -16,7 +18,7 @@
 - 默认按32个KV token、64个通道的小块解码，在一组query/head之间共享并用`tl.dot`计算，在线softmax归并；不生成随历史长度增长的全局dense KV。
 - cache-only decode、混合请求和有历史的长continuation都走新路径；混批中的无历史prefill单独使用原生attention，保留当前chunk的未量化语义。
 - standalone KV update会立即使被重写位置的staging标签失效，防止cache-only读取旧窗口值。MTP拒绝后的尾部重写、block回收和padding有回归覆盖。
-- staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；启动门禁增加16K前缀与真实1536-token页。paged分块32在目标910B4编译时出现UB溢出，默认已恢复为通过过真机门禁的4。
+- staging在槽编号可由FP32精确表示时使用浮点稳定排序。streaming门禁覆盖实际128-token kernel页、24K前缀和16/32/64请求；其他dtype/页大小通过`probe_streaming.py --compat`分别研究，不参与默认生产验收。
 - MTP BF16影子池、FP32窗口、旋转矩阵继续计入常驻预算；新split暂存和本步query变换的保守临时预留按worker计入预算，不按层复制大工作区。
 - 启动 READY manifest 按 TP rank 检查 FULL 层覆盖和源码指纹。安装器默认重装当前 checkout 的 editable 包，避免复用旧 wheel。
 - probe 显式拒绝 NaN/Inf。新内核有独立跨页、多请求和空段 NPU 门禁。

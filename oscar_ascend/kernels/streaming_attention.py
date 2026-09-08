@@ -572,6 +572,21 @@ if triton is not None:
         tl.store(LSE + query * HQ + head, maximum + tl.log(safe))
 
 
+def validate_npu_profile(dtype, block_size, *, device_type="npu"):
+    """Packed-kernel probes passed on NPU for the deployed bf16/128 profile.
+
+    FP16 with 1536-token pages failed static buffer planning on the deployed
+    compiler; the two axes are not yet isolated. Do not silently claim support
+    for either unverified configuration or downcast/reformat the model.
+    """
+    if device_type == "npu" and (dtype != torch.bfloat16 or block_size != 128):
+        raise ValueError(
+            "Streaming NPU deployment currently requires bf16 queries and "
+            f"128-token cache blocks; got dtype={dtype}, block_size={block_size}. "
+            "Other profiles require the standalone compatibility probe."
+        )
+
+
 def streaming_attention_triton(
     q,
     k_new,
@@ -585,11 +600,14 @@ def streaming_attention_triton(
     stage=None,
     *,
     workspace_bytes=32 * 1024 * 1024,
+    experimental_profile=False,
 ):
     if triton is None:
         raise RuntimeError("Triton is required for streaming NPU attention")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("Streaming matrix attention requires bf16/fp16 queries")
+    if not experimental_profile:
+        validate_npu_profile(q.dtype, kc.shape[1], device_type=q.device.type)
     if (k_new is None) != (v_new is None):
         raise ValueError("Both new K and V must be supplied together")
     n, hq, d = q.shape
