@@ -126,7 +126,20 @@ def timed(label, fn):
     return wrapped
 
 
-def capture(phase, step, device, fn, args, kwargs):
+def scheduled_shape(scheduler_output):
+    counts = [
+        int(n)
+        for n in getattr(scheduler_output, "num_scheduled_tokens", {}).values()
+        if n > 0
+    ]
+    return {
+        "requests": len(counts),
+        "tokens": sum(counts),
+        "max_tokens_per_request": max(counts, default=0),
+    }
+
+
+def capture(phase, step, device, fn, args, kwargs, *, batch=None):
     record = Record(device)
     token = _active.set(record)
     success = False
@@ -151,6 +164,7 @@ def capture(phase, step, device, fn, args, kwargs):
                     "sorts": dict(record.sorts),
                     "integer_sort_stacks": record.integer_sort_stacks,
                     "first_forward": record.first_forward,
+                    "batch": batch,
                     "scope": "synchronized diagnostic; inclusive stages overlap; cold calls include JIT; not throughput",
                 },
                 sort_keys=True,
@@ -163,6 +177,12 @@ def install_diagnostics(runner_class):
     limit = int(os.environ.get("OSCAR_ASCEND_PROFILE_STEPS", "0"))
     if limit <= 0 or getattr(runner_class, "_oscar_perf_installed", False):
         return
+    min_requests = int(os.environ.get("OSCAR_ASCEND_PROFILE_MIN_REQUESTS", "0"))
+    max_per_request = int(
+        os.environ.get("OSCAR_ASCEND_PROFILE_MAX_TOKENS_PER_REQUEST", "0")
+    )
+    if min_requests < 0 or max_per_request < 0:
+        raise ValueError("OSCAR diagnostic request filters must be nonnegative")
     from . import backend
     from .kernels import paged_attention, prefill
 
@@ -194,8 +214,22 @@ def install_diagnostics(runner_class):
         runner._oscar_perf_sample = None
         if _rank() != 0 or total <= 0 or count >= limit:
             return original_execute(runner, scheduler_output, *args, **kwargs)
+        batch = scheduled_shape(scheduler_output)
+        if batch["requests"] < min_requests or (
+            max_per_request and batch["max_tokens_per_request"] > max_per_request
+        ):
+            if not getattr(runner, "_oscar_perf_waiting_printed", False):
+                print(
+                    f"[oscar-ascend] PERF waiting for requests>={min_requests}, "
+                    f"max tokens/request<={max_per_request or 'unlimited'}; "
+                    "nonmatching steps do not consume the capture budget",
+                    flush=True,
+                )
+                runner._oscar_perf_waiting_printed = True
+            return original_execute(runner, scheduler_output, *args, **kwargs)
         runner._oscar_perf_count = count + 1
         runner._oscar_perf_sample = count + 1
+        runner._oscar_perf_batch = batch
         return capture(
             "execute_model",
             count + 1,
@@ -203,6 +237,7 @@ def install_diagnostics(runner_class):
             original_execute,
             (runner, scheduler_output, *args),
             kwargs,
+            batch=batch,
         )
 
     @functools.wraps(original_sample)
@@ -218,12 +253,15 @@ def install_diagnostics(runner_class):
             original_sample,
             (runner, *args),
             kwargs,
+            batch=runner._oscar_perf_batch,
         )
 
     runner_class.execute_model = execute
     runner_class.sample_tokens = sample
     runner_class._oscar_perf_installed = True
     print(
-        f"[oscar-ascend] PERF enabled: first {limit} scheduled steps on rank 0; synchronized timings alter throughput",
+        f"[oscar-ascend] PERF enabled: first {limit} matching steps on rank 0; "
+        f"min_requests={min_requests}, max_tokens_per_request={max_per_request or 'unlimited'}; "
+        "synchronized timings alter throughput",
         flush=True,
     )

@@ -55,7 +55,8 @@ def test_capture_preserves_exceptions_and_resets_context(capsys):
     assert records(capsys)[0]["success"] is False
 
 
-def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys):
+@pytest.mark.parametrize("filtered", [False, True])
+def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys, filtered):
     from oscar_ascend import backend
     from oscar_ascend.kernels import paged_attention, prefill
 
@@ -75,6 +76,10 @@ def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys):
     )
     monkeypatch.setattr(prefill, "npu_prefill_prepared", prefill.npu_prefill_prepared)
     monkeypatch.setenv("OSCAR_ASCEND_PROFILE_STEPS", "2")
+    monkeypatch.setenv("OSCAR_ASCEND_PROFILE_MIN_REQUESTS", "2" if filtered else "0")
+    monkeypatch.setenv(
+        "OSCAR_ASCEND_PROFILE_MAX_TOKENS_PER_REQUEST", "4" if filtered else "0"
+    )
 
     class Runner:
         device = torch.device("cpu")
@@ -88,8 +93,23 @@ def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys):
     diag.install_diagnostics(Runner)
     runner = Runner()
     assert runner.execute_model(NS(total_num_scheduled_tokens=0)) == 1
+    if filtered:
+        for counts in ({"a": 4}, {"a": 9, "b": 4}, {"a": 4, "padding": 0}):
+            total = sum(counts.values())
+            assert (
+                runner.execute_model(
+                    NS(total_num_scheduled_tokens=total, num_scheduled_tokens=counts)
+                )
+                == total + 1
+            )
+            assert runner.sample_tokens(5) == 8
     for _ in range(4):
-        assert runner.execute_model(NS(total_num_scheduled_tokens=7)) == 8
+        assert (
+            runner.execute_model(
+                NS(total_num_scheduled_tokens=7, num_scheduled_tokens={"a": 3, "b": 4})
+            )
+            == 8
+        )
         assert runner.sample_tokens(5) == 8
     reports = records(capsys)
     assert [(r["phase"], r["step"]) for r in reports] == [
@@ -98,4 +118,8 @@ def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys):
         ("execute_model", 2),
         ("sample_tokens", 2),
     ]
+    assert all(
+        r["batch"] == {"requests": 2, "tokens": 7, "max_tokens_per_request": 4}
+        for r in reports
+    )
     assert diag._active.get() is None

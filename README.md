@@ -32,7 +32,7 @@ python3 -m venv .venv
 .venv/bin/python delivery/probe_paged.py --device cpu
 ```
 
-本轮执行：backend/prefill/版本/类型/分块配置/诊断/准备缓冲/A/B工具回归76项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮执行：backend/prefill/版本/类型/分块配置/诊断/准备缓冲/A/B工具回归77项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
@@ -82,6 +82,8 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 
 只计时rank 0前6个非空调度步骤及其采样，输出真实forward的加载路径/代码指纹、形状/开关、各OSCAR阶段耗时、整数sort调用栈。`inclusive_ms`包含嵌套阶段，不能相加；`wait_before_ms`记录进入该阶段前等待已提交设备任务的时间。同步和Python算子追踪会改变这几个步骤的吞吐，首轮也可能包含JIT，不能把诊断吞吐当作正式benchmark。默认关闭；达到步数后自动停止采集，不修改计算结果。
 
+并发诊断用 `./load`：同样安装、检查并启动服务，等待rank 0出现至少8个正调度请求、每请求最多4个token的步骤，只采集4个匹配步骤及其采样。用原有客户端发起32并发负载；它不会自动发送请求。不匹配的prefill/单请求步骤不消耗采样次数，日志会显示 `PERF waiting`。PERF的batch字段给出实际调度请求数及token数；不要用APIServer的Running数代替单步实际调度数。
+
 ## 关键配置
 
 | 环境变量 | 默认/含义 |
@@ -93,6 +95,8 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 | `OSCAR_ASCEND_USE_PAGED` | 默认0：INT2反量化 + 原生融合attention；1显式测试并启用自写分页内核（目前真机很慢） |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |
+| `OSCAR_ASCEND_PROFILE_MIN_REQUESTS` | 默认0不筛选；只采集至少此数量的正调度请求，`./load`设为8 |
+| `OSCAR_ASCEND_PROFILE_MAX_TOKENS_PER_REQUEST` | 默认0不限制；过滤单请求调度token数超过上限的步骤，`./load`设为4 |
 | `OSCAR_ASCEND_FUSED_PREP` | 默认0使用独立反量化/窗口拼接；1显式测试准备融合，仍需通过数值门禁且不代表性能验收 |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | serve默认仓库内 `oscar_rotations.pt`；启动缓存初始化时检查目标层覆盖和正交性 |

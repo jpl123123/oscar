@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Profile concurrent short-query batches; use the existing load generator.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export OSCAR_ASCEND_PROFILE_STEPS=4
+export OSCAR_ASCEND_PROFILE_MIN_REQUESTS=8
+export OSCAR_ASCEND_PROFILE_MAX_TOKENS_PER_REQUEST=4
+exec bash "$REPO_ROOT/delivery/install_and_launch.sh" "$@"
