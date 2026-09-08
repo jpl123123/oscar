@@ -1,6 +1,7 @@
 """Verify native prefill causality/GQA across the 2048 compressed-mask boundary."""
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -53,7 +54,7 @@ def run(device):
                 f"PREFILL PASS device={device} dtype={dtype} prefix={prefix} q_len={n}",
                 flush=True,
             )
-    if os.environ.get("OSCAR_ASCEND_FUSED_PREP", "1") == "1":
+    if os.environ.get("OSCAR_ASCEND_FUSED_PREP", "0") == "1":
         check_prepared_buffers(device)
     check_native_mtp(device)
 
@@ -103,7 +104,15 @@ def check_prepared_buffers(device):
             )
 
 
-def check_native_mtp(device):
+def check_native_mtp(
+    device,
+    *,
+    compare=False,
+    prefix=24579,
+    nq=4,
+    block_sizes=(128, 1536),
+    windows=(False, True),
+):
     """Real OSCAR write/stage/forward, actual 6:1 GQA and 24K MTP history."""
     if device == "npu":
         from vllm.platforms import current_platform
@@ -118,12 +127,12 @@ def check_native_mtp(device):
     from oscar_ascend.kernels.paged_attention import oscar_paged_attention_ref
 
     torch.manual_seed(93)
-    d, hk, hq, prefix, nq = 256, 1, 6, 24579, 4
+    d, hk, hq = 256, 1, 6
     rk, rv = [torch.linalg.qr(torch.randn(d, d)).Q for _ in range(2)]
     oldk, oldv = [torch.randn(prefix, hk, d, dtype=torch.bfloat16) for _ in range(2)]
     q, k, v = [torch.randn(nq, h, d, dtype=torch.bfloat16) for h in (hq, hk, hk)]
-    for bs in (128, 1536):
-        for window in (False, True):
+    for bs in block_sizes:
+        for window in windows:
             blocks = (prefix + nq + bs - 1) // bs
             bt = (
                 torch.arange(blocks - 1, -1, -1, dtype=torch.int32)
@@ -145,7 +154,7 @@ def check_native_mtp(device):
             impl._oscar_setup()
             impl._oscar.use_paged = False
             impl._oscar.use_fused_prep = (
-                os.environ.get("OSCAR_ASCEND_FUSED_PREP", "1") == "1"
+                os.environ.get("OSCAR_ASCEND_FUSED_PREP", "0") == "1"
             )
             impl._oscar_use_triton = (
                 device == "npu"
@@ -155,6 +164,14 @@ def check_native_mtp(device):
             impl._oscar.sink_tokens = 128
             impl._oscar.recent_tokens = 256
             impl._oscar.staging_tokens = 8192
+            if compare:
+                # Match serving defaults for the work shared by both variants.
+                impl._oscar.k_clip_ratio = float(
+                    os.environ.get("OSCAR_ASCEND_K_CLIP_RATIO", "0.96")
+                )
+                impl._oscar.v_clip_ratio = float(
+                    os.environ.get("OSCAR_ASCEND_V_CLIP_RATIO", "0.92")
+                )
             layer = SimpleNamespace(
                 layer_name="probe.layers.0.self_attn.attn",
                 _oscar_rots=(rk.to(device), rv.to(device)),
@@ -184,6 +201,55 @@ def check_native_mtp(device):
             )
             fresh = [t.to(device) for t in (q, k, v)]
             output = torch.empty(nq, hq, d, dtype=q.dtype, device=device)
+            if compare:
+                from delivery.benchmark_utils import compare_calls
+
+                def call(
+                    fused,
+                    impl=impl,
+                    layer=layer,
+                    fresh=fresh,
+                    cache=cache,
+                    md=md,
+                    output=output,
+                ):
+                    impl._oscar.use_fused_prep = fused
+                    return impl.forward(layer, *fresh, cache, md, output=output)
+
+                def sync():
+                    if device == "npu":
+                        torch.npu.synchronize()
+
+                times = compare_calls(
+                    {
+                        "baseline": lambda call=call: call(False),
+                        "fused": lambda call=call: call(True),
+                    },
+                    sync,
+                )
+                print(
+                    "PREP BENCH "
+                    + json.dumps(
+                        {
+                            "device": device,
+                            "prefix": prefix,
+                            "q_len": nq,
+                            "hq": hq,
+                            "block_size": bs,
+                            "window": window,
+                            "clip_ratios": [
+                                impl._oscar.k_clip_ratio,
+                                impl._oscar.v_clip_ratio,
+                            ],
+                            "timings": times,
+                            "baseline_over_fused": times["baseline"]["median_ms"]
+                            / times["fused"]["median_ms"],
+                            "scope": "same inputs; interleaved single-layer full forward; excludes model/communication; does not change serving defaults",
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
             actual = impl.forward(layer, *fresh, cache, md, output=output).cpu().float()
             stage = (
                 None

@@ -82,3 +82,11 @@ paged约占模型执行92%，每FULL层约272 ms；后续步骤没有随首轮�
 门禁增加准备缓冲的逐元素比较：257个历史token（尾tile）、非连续页、Hk=1/2、bf16/int8物理cache、fp16/bf16输出、窗口命中/缺失和owner碰撞。随后继续跑完整24K MTP及计时。74项本地pytest和CPU门禁通过；尚未在本机执行新Triton内核，不能宣称新增融合已有NPU收益。
 
 PERF新增prepare_native_kv计时；原生算子改标为native_attention，边界为已准备好完整输入的调用，避免与旧native_prefill（包含concat）的计时混淆。比较收益仍以execute_model和forward的相同边界为主。
+
+## 05:05复测：准备融合未证明提速，恢复默认并加入同进程A/B
+
+use_fused_prep=true。第4–6步execute_model约599 ms，forward约295 ms，prepare_native_kv约181 ms；前一轮分别约556/279 ms，准备区间wait_before约166 ms（计时边界不同）。本轮未证明新增融合有收益。两轮其他阶段也有变化，因此不能把全部约43 ms差额严格归因于融合代码；后续需要同进程交错比较。
+
+第2步prepare_native_kv合计10018 ms，远高于后续181 ms；可能包含未被此前odd-prefix门禁预热的aligned-prefix编译特化，但没有编译事件trace，不能断言10秒全部为编译。新的PERF增加各阶段first_ms/max_ms，以区分首个调用与其余调用的贡献。
+
+恢复一键和直接probe的FUSED_PREP默认0，保留已验证的原生融合读取。新增 `./bench`：同一impl/cache/输入，交错运行基线与候选，分别记录first_call_ms和6次预热采样的中位数；先比较结果，数值不符不报告有效性能结果，复制输出避免复用输出buffer掩盖错误。覆盖MTP与实际continuation形状、6:1 GQA、128页、窗口开启、0.96/0.92裁剪。不会修改服务默认值。76项CPU回归通过，A/B工具已在CPU MTP形状执行；CPU结果不用于推断NPU性能。

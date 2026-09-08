@@ -5,9 +5,9 @@
 面向 Qwen3.5-27B W8A8 + MTP、TP4、eager 执行的插件。通过
 `vllm.general_plugins` 替换 FULL attention impl，并包装 worker 的显存预算与缓存初始化接口；不修改 reference 或安装目录内的 vllm/vllm-ascend 源码。GDN 继续使用原生实现。
 
-**当前版本 0.2.0：真机诊断已确认，向量paged内核在4-token MTP步骤中占约92%的模型执行时间。默认已切换为INT2历史反量化 + 原生融合注意力，保留窗口和旋转，并取得MTP实测改善；下一阶段的KV准备融合仍待NPU复验。**
+**当前版本 0.2.0：默认采用INT2历史反量化 + 原生融合注意力，保留窗口和旋转，已取得MTP实测改善。自写paged与KV准备融合均保留为实验路径，默认关闭。**
 
-后续真机复测：重复MTP步骤的execute_model由约4.72秒降至0.556秒（同步诊断口径约8.5倍，非端到端吞吐倍数）。新增KV准备融合，将反量化、窗口选择及最终类型转换直接写入原生输入缓冲；通过逐元素与完整MTP门禁后启用。这一新增融合仍待NPU复验。
+真机复测：原生融合读取使重复MTP步骤的execute_model由约4.72秒降至0.556秒（同步诊断口径约8.5倍，非端到端吞吐倍数）。随后KV准备融合在另一次运行中记录约0.599秒，没有证明进一步提速，因此默认恢复独立反量化/窗口拼接；性能实验采用同进程交错A/B比较。
 
 ## 本轮变化
 
@@ -32,7 +32,7 @@ python3 -m venv .venv
 .venv/bin/python delivery/probe_paged.py --device cpu
 ```
 
-本轮执行：backend/prefill/版本/类型/分块配置/诊断/准备缓冲回归74项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮执行：backend/prefill/版本/类型/分块配置/诊断/准备缓冲/A/B工具回归76项通过，新增6:1 GQA、24K历史、4-token MTP和窗口开关的真实backend CPU检查通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
@@ -70,6 +70,8 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 
 真实验收还需原生 BF16 / legacy OSCAR / packed OSCAR 在相同模型、上下文和并发下的任务精度、MTP接受率、TTFT、TPOT、吞吐和峰值内存对比。
 
+停服务后运行 `./bench`，可在同一份输入和缓存上交错比较旧、新KV准备路径。覆盖实际6:1 GQA、128-token物理页、窗口和serve裁剪默认值，以及24579历史+4-token MTP、15360历史+9256-token continuation两种形状。输出 `PREP BENCH` JSON中的首次调用耗时、6次交错采样、中位数与数值匹配结果；`baseline_over_fused > 1`才表示候选更快。首次调用可能命中已有编译缓存，不能把它一概称为纯编译耗时。该工具只测单层，不启动服务、不切换服务默认值。
+
 服务仍慢时，先停旧服务，再采集一次有界诊断：
 
 ```bash
@@ -91,7 +93,7 @@ grep '\[oscar-ascend\] PERF' /tmp/oscar_ascend_logs/serve.log
 | `OSCAR_ASCEND_USE_PAGED` | 默认0：INT2反量化 + 原生融合attention；1显式测试并启用自写分页内核（目前真机很慢） |
 | `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_PROFILE_STEPS` | 默认0关闭；正数表示rank 0需要采集的真实调度步数，包含execute_model和sample_tokens |
-| `OSCAR_ASCEND_FUSED_PREP` | 插件默认0；一键在Triton启用且准备缓冲/MTP门禁通过后设1；0使用上一版独立反量化/窗口拼接 |
+| `OSCAR_ASCEND_FUSED_PREP` | 默认0使用独立反量化/窗口拼接；1显式测试准备融合，仍需通过数值门禁且不代表性能验收 |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | serve默认仓库内 `oscar_rotations.pt`；启动缓存初始化时检查目标层覆盖和正交性 |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | serve默认0.96/0.92；插件直接加载时默认0，范围[0,1] |

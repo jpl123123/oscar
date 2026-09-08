@@ -217,7 +217,8 @@ fi
 
 # Multi-query kernel is gated separately: existing decode probes do not cover MTP.
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
-    PREP_MODE="${OSCAR_ASCEND_FUSED_PREP:-${OSCAR_ASCEND_USE_TRITON:-1}}"
+    # Fused preparation passed numerics but did not improve target NPU timing.
+    PREP_MODE="${OSCAR_ASCEND_FUSED_PREP:-0}"
     OSCAR_ASCEND_FUSED_PREP="$PREP_MODE" "$PYTHON" delivery/probe_prefill.py --device npu \
         || fail "原生融合 prefill probe FAIL — 拒绝 serve"
     export OSCAR_ASCEND_FUSED_PREP="$PREP_MODE"

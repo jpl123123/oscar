@@ -61,8 +61,12 @@ class Record:
         finally:
             _sync(self.device)
             stage = self.stages[label]
+            elapsed = (time.perf_counter() - start) * 1000
+            if stage["calls"] == 0:
+                stage["first_ms"] = elapsed
+            stage["max_ms"] = max(stage.get("max_ms", 0.0), elapsed)
             stage["calls"] += 1
-            stage["inclusive_ms"] += (time.perf_counter() - start) * 1000
+            stage["inclusive_ms"] += elapsed
             stage["wait_before_ms"] += (start - before) * 1000
 
 
@@ -177,7 +181,9 @@ def install_diagnostics(runner_class):
     paged_attention.oscar_paged_attention_triton = timed(
         "paged_attention", paged_attention.oscar_paged_attention_triton
     )
-    prefill.npu_prefill_prepared = timed("native_attention", prefill.npu_prefill_prepared)
+    prefill.npu_prefill_prepared = timed(
+        "native_attention", prefill.npu_prefill_prepared
+    )
     original_execute = runner_class.execute_model
     original_sample = runner_class.sample_tokens
 
