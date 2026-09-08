@@ -261,7 +261,9 @@ if triton is not None:
 
 
 def paged_block_kv():
-    value = int(os.environ.get("OSCAR_ASCEND_PAGED_BLOCK_KV", "32"))
+    # 32 overflows UB in the deployed Ascend910B4 compiler (PlanMemory).
+    # Larger tiles remain opt-in experiments; 4 passed the target NPU probe.
+    value = int(os.environ.get("OSCAR_ASCEND_PAGED_BLOCK_KV", "4"))
     if value not in (4, 16, 32, 64, 128):
         raise ValueError("OSCAR_ASCEND_PAGED_BLOCK_KV must be 4, 16, 32, 64 or 128")
     return value

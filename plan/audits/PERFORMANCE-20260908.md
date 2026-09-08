@@ -1,5 +1,7 @@
 # 2026-09-08 NPU 服务性能回归
 
+> 后续真机纠正：原生融合prefill门禁通过；分块32在paged stage1出现UB溢出及编译器重试失败。默认值现恢复4，微基准也不再默认运行32。下文的4→32描述保留为本次实验记录，不能视为有效优化或当前默认值。
+
 用户提供两段日志，并说明除 OSCAR 外其余配置相同。OSCAR 片段为09-08 03:03–03:08，原生片段为09-07；不是对齐的完整benchmark报告，不能用逐行均值作严格速度比或推导TTFT/TPOT。
 
 | 指标 | OSCAR 日志 | 原生日志 |
@@ -36,3 +38,9 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 ```
 
 这两项分别测单层读取和dense prefill；不包含完整forward的store、staging更新、调度、通信、模型其它层。最终需相同请求集、相同eager/图设置、固定并发与上下文的端到端benchmark，记录TTFT/TPOT、generation吞吐与MTP接受率。若仍慢，应采集NPU trace区分写入/旋转/裁剪、staging、attention、CPU同步与编译停顿，不能继续把小probe PASS当作性能证据。
+
+## 分块32的编译失败
+
+用户03:24复测日志在 `_oscar_paged_stage1` 出现 `IR Dump After PlanMemory Failed (hivm-plan-memory)`，随后报告 `Ub overflow detected`；编译器关闭code-motion重试又报 `Failed to obtain op buffer shape size which should be static`。IR包含大量32×256临时张量以及reduce临时缓冲，直接把KV分块放大8倍没有解决临时数据占用问题。
+
+生产与微基准默认均恢复分块4；保留原生融合prefill、浮点稳定排序、长上下文门禁和计时工具。没有自动尝试16或吞掉编译失败，也没有关闭数值门禁。今后扩大分块需要先降低K/V临时张量的同时存活量并在目标编译器测定UB占用；不能根据循环数下降直接认定可用或提速。

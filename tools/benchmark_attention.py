@@ -30,7 +30,12 @@ def main():
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--mode", choices=["decode", "prefill", "all"], default="decode")
     ap.add_argument(
-        "--kv-tiles", nargs="+", type=int, choices=[4, 16, 32, 64, 128], default=[4, 32]
+        "--kv-tiles",
+        nargs="+",
+        type=int,
+        choices=[4, 16, 32, 64, 128],
+        default=[4],
+        help="Default: validated tile 4. Larger tiles are experimental; 32 overflowed UB on Ascend910B4.",
     )
     ap.add_argument("--block-size", type=int, default=1536)
     ap.add_argument("--prefill-tokens", type=int, default=15360)

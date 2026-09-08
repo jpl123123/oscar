@@ -13,7 +13,7 @@
 - sink/recent 保留未量化数据，写入时旋转到 FP32 空间；避免历史 KV 反复逆旋转。窗口现在跨步保留，哈希碰撞选择同一个 owner/value 写入者，非窗口重写会使旧 tag 失效。
 - 新增 MTP 多 query 分页 Triton attention：直接从 INT2 历史缓存读取，当前 chunk 使用未量化 K/V，窗口按 owner tag 覆盖。每请求 q_len≤16 时可走此路径；混合批次中的长 prefill 单独走 dense 路径。
 - dense continuation 在旋转域计算，只对新 Q/K/V 和最终输出旋转；NPU 使用原生融合注意力，仍会物化历史 KV。CPU 保留 SDPA oracle。
-- staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；paged KV 分块从4改为32，启动门禁增加16K前缀与真实1536-token页。
+- staging 在槽编号可由 FP32 精确表示时使用浮点稳定排序，避免整数 ArgSort 的 AiCPU 回退；启动门禁增加16K前缀与真实1536-token页。paged分块32在目标910B4编译时出现UB溢出，默认已恢复为通过过真机门禁的4。
 - MTP BF16 影子池、FP32 窗口、旋转矩阵纳入常驻内存预算，并在缓存初始化时分配、检查。临时算子的峰值内存仍需 NPU 压测。
 - 启动 READY manifest 按 TP rank 检查 FULL 层覆盖和源码指纹。安装器默认重装当前 checkout 的 editable 包，避免复用旧 wheel。
 - probe 显式拒绝 NaN/Inf。新内核有独立跨页、多请求和空段 NPU 门禁。
@@ -30,7 +30,7 @@ python3 -m venv .venv
 .venv/bin/python delivery/probe_paged.py --device cpu
 ```
 
-本轮执行：backend/prefill/版本/类型回归48项通过，新增prefill因果与16K分页CPU镜像通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
+本轮执行：backend/prefill/版本/类型/分块配置回归51项通过，新增prefill因果与16K分页CPU镜像通过。CPU 使用 PyTorch 2.14.0，不代表部署环境 torch-npu 的结果。
 
 历史问题审查见 `plan/audits/REVIEW-20260908.md`；历史复现脚本固定读取审查提交 `e451ca6`，不用于验证当前代码。实现与验收记录见 `plan/IMPLEMENTATION-20260908.md`。
 
@@ -78,7 +78,7 @@ python3 tools/benchmark_attention.py --device npu --mode prefill --prefill-token
 | `OSCAR_ASCEND_PACKED` | serve默认1；0使用BF16物理槽几何 |
 | `OSCAR_ASCEND_USE_TRITON` | serve默认1；0使用torch参考内核 |
 | `OSCAR_ASCEND_USE_PAGED` | 插件默认0；一键paged门禁通过后设为1；每请求q_len≤16使用新内核 |
-| `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认32；允许4/16/32/64/128；调整后必须重新运行paged门禁 |
+| `OSCAR_ASCEND_PAGED_BLOCK_KV` | 默认4；16/32/64/128仅供显式实验，32已在目标910B4出现UB溢出；调整后必须重新运行paged门禁 |
 | `OSCAR_ASCEND_REQUIRE_TRITON` | 一键默认1，门禁失败阻断；0为诊断降级模式 |
 | `OSCAR_ASCEND_K/V_ROTATION_PATH` | serve默认仓库内 `oscar_rotations.pt`；启动缓存初始化时检查目标层覆盖和正交性 |
 | `OSCAR_ASCEND_K/V_CLIP_RATIO` | serve默认0.96/0.92；插件直接加载时默认0，范围[0,1] |

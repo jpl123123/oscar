@@ -36,7 +36,7 @@ def run(device, use_triton):
 
         if AscendAttentionBackendImpl is object:
             raise RuntimeError("NPU paged probe requires the real Ascend backend")
-        print("PAGED native backend import PASS", flush=True)
+        print(f"PAGED native backend import PASS; block_kv={paged_block_kv()}", flush=True)
     torch.manual_seed(42)
     d, hk, hq, bs = 256, 1, 8, 128
     qsl, seqs = [0, 1, 5, 7], [1, 133, 259]
