@@ -6,13 +6,17 @@
 """
 from __future__ import annotations
 
+from enum import Enum
+from importlib import import_module, util
+
 import torch
 
 from .config import OscarAscendConfig
 from .format import K_IDX_OFF, VALUES_PER_BYTE, check_d
-from .kernels.store_kernel import oscar_store_ref
 from .kernels.decode_kernel import oscar_decode_ref, oscar_prefill_ref
-from .kernels.dequant_kernel import oscar_full_dequant, triton as _k_triton
+from .kernels.dequant_kernel import oscar_full_dequant
+from .kernels.dequant_kernel import triton as _k_triton
+from .kernels.store_kernel import oscar_store_ref
 from .rotation import get_layer_rotation
 
 
@@ -48,14 +52,34 @@ def metadata_batch_lists(attn_metadata) -> tuple[list, list]:
         seq_cpu if seq_cpu is not None else attn_metadata.seq_lens), "seq_lens")
     return qsl, seqs
 
-try:
-    from vllm_ascend.attention.attention_v1 import (
-        AscendAttentionBackendImpl,
-        AscendAttentionState,
-    )
-except Exception:  # pragma: no cover — 平台缺失时仅作占位，plugin 不会启用
-    AscendAttentionBackendImpl = object  # type: ignore
-    AscendAttentionState = object  # type: ignore
+class _CPUAttentionState(Enum):
+    """Reference-only states when neither serving package is installed."""
+
+    PrefillNoCache = 0
+    PrefillCacheHit = 1
+    DecodeOnly = 2
+    ChunkedPrefill = 3
+    SpecDecoding = 4
+
+
+def _load_attention_types():
+    if all(util.find_spec(name) is None for name in ("vllm", "vllm_ascend")):
+        return object, _CPUAttentionState
+    try:
+        # Resolve the lazy platform before entering the native attention import
+        # graph. Installed but broken vendor dependencies must never become CPU
+        # placeholders, even when the failure is a transitive ImportError.
+        _ = import_module("vllm.platforms").current_platform
+        native = import_module("vllm_ascend.attention.attention_v1")
+        return native.AscendAttentionBackendImpl, native.AscendAttentionState
+    except Exception as exc:
+        raise RuntimeError(
+            "OSCAR could not import the installed Ascend attention backend; "
+            "see the original exception above (CPU placeholders are disabled)."
+        ) from exc
+
+
+AscendAttentionBackendImpl, AscendAttentionState = _load_attention_types()
 
 
 class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: ignore[misc]

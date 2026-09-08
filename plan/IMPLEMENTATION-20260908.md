@@ -65,3 +65,11 @@
 归并内核改用 `tl.where(e_sum > 0.0, e_sum, 1.0)`，除法和 log 共用安全分母；非空结果保持原公式，空序列输出零、LSE 为负无穷。普通 decode 与 paged attention 共用此修复。
 
 新增 JIT 浮点字面量守卫，以及执行实际归并尾部表达式的 CPU 类型/数值回归。33 项 pytest、17 项 CPU 数值镜像、测试文件 Ruff 和 diff whitespace 检查通过。未在本机执行 Ascend 编译；需重新运行一键启动门禁确认。
+
+## Paged probe 原生后端导入故障
+
+用户复测确认旧 Triton probe 的 512B/256B 几何均通过，decode 误差为 1.907e-06。随后 paged probe 在真实 backend.forward 中因 `AscendAttentionState = object` 失败；此前捕获所有导入异常的逻辑隐藏了原始错误，不能从该日志确定缺失的依赖或符号。
+
+独立 NPU probe 现在先解析 current_platform，并调用原生 CLI 同样使用的 `pre_register_and_update()` 应用全局补丁，再加载真实后端和 SpecDecoding 状态。后端只有在 vllm 与 vllm_ascend 均未安装时才提供 CPU 参考类及完整状态枚举；已安装环境的导入失败保留异常链并立即终止，不再假装加载成功。后端导入也先解析平台，避免在 attention 导入途中才启动懒加载平台。
+
+新增回归覆盖缺省 attn_state 的实际 forward、平台导入顺序和导入故障保留；移除 MTP 测试替换状态枚举的遮蔽。38 项 pytest、bf16/int8 两种 CPU paged oracle、测试/probe Ruff、Python 编译及 diff 检查通过。该初始化调整仍待 NPU 复验，尚不能确认底层导入问题已消除。日志中的整数 ArgSort 回退 AiCPU 属于另一个待测性能问题，本次未改动其碰撞处理语义。

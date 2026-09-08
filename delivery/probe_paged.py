@@ -19,6 +19,23 @@ from oscar_ascend.kernels.store_kernel import oscar_store_ref, oscar_store_trito
 
 
 def run(device, use_triton):
+    if device == "npu" and use_triton:
+        # A standalone script does not pass through vLLM's CLI bootstrap.
+        # Apply the same global vendor patches before importing attention.
+        from vllm.platforms import current_platform
+
+        if current_platform.device_type != "npu":
+            raise RuntimeError("NPU paged probe requires the Ascend platform plugin")
+        current_platform.pre_register_and_update()
+        from oscar_ascend.backend import (
+            AscendAttentionBackendImpl,
+            AscendAttentionState,
+            AscendOscarAttentionBackendImpl,
+        )
+
+        if AscendAttentionBackendImpl is object:
+            raise RuntimeError("NPU paged probe requires the real Ascend backend")
+        print("PAGED native backend import PASS", flush=True)
     torch.manual_seed(42)
     d, hk, hq, bs = 256, 1, 8, 128
     qsl, seqs = [0, 1, 5, 7], [1, 133, 259]
@@ -91,8 +108,6 @@ def run(device, use_triton):
             # not just a manually assembled arena passed to the new kernel.
             from types import SimpleNamespace
 
-            from oscar_ascend.backend import AscendOscarAttentionBackendImpl
-
             impl = AscendOscarAttentionBackendImpl.__new__(
                 AscendOscarAttentionBackendImpl
             )
@@ -127,6 +142,7 @@ def run(device, use_triton):
                 ]
             )
             md = SimpleNamespace(
+                attn_state=AscendAttentionState.SpecDecoding,
                 num_actual_tokens=7,
                 slot_mapping=fresh_slots,
                 actual_seq_lengths_q=qsl[1:],

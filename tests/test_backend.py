@@ -324,11 +324,6 @@ def test_forward_routes_mtp_to_paged_without_full_dequant(monkeypatch):
     impl._oscar.use_paged = True
     impl._oscar_use_triton = True
     monkeypatch.setattr(
-        backend,
-        "AscendAttentionState",
-        NS(ChunkedPrefill="prefill", DecodeOnly="decode"),
-    )
-    monkeypatch.setattr(
         "oscar_ascend.kernels.store_kernel.oscar_store_triton", oscar_store_ref
     )
     calls = []
@@ -386,3 +381,67 @@ def test_forward_routes_mtp_to_paged_without_full_dequant(monkeypatch):
     )
     torch.testing.assert_close(out.reshape(19, 2, 64), expected)
     assert calls[-1] == ([0, 2], [2])
+
+
+def test_forward_without_attention_state_uses_prefill():
+    impl, layer, cache = fixture()
+    impl._oscar.use_paged = False
+    impl._oscar_use_triton = False
+    impl._oscar.window_enabled = False
+    md = meta([0, 1], [2], [2])
+    q, k, v = torch.randn(2, 2, 64), torch.randn(2, 1, 64), torch.randn(2, 1, 64)
+    out = impl.forward(layer, q, k, v, cache, md, output=torch.empty_like(q))
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(0, 1), k.transpose(0, 1).repeat_interleave(2, 0),
+        v.transpose(0, 1).repeat_interleave(2, 0), is_causal=True,
+    ).transpose(0, 1)
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_native_import_resolves_platform_before_attention(monkeypatch):
+    from oscar_ascend import backend
+
+    monkeypatch.setattr(backend.util, "find_spec", lambda name: object())
+    calls = []
+    native = NS(AscendAttentionBackendImpl=type("NativeImpl", (), {}),
+                AscendAttentionState=backend._CPUAttentionState)
+
+    class PlatformModule:
+        @property
+        def current_platform(self):
+            calls.append("resolve_platform")
+            return NS(device_type="npu")
+
+    def load(name):
+        calls.append(name)
+        return PlatformModule() if name == "vllm.platforms" else native
+
+    monkeypatch.setattr(backend, "import_module", load)
+    assert backend._load_attention_types() == (native.AscendAttentionBackendImpl, native.AscendAttentionState)
+    assert calls == ["vllm.platforms", "resolve_platform", "vllm_ascend.attention.attention_v1"]
+
+
+@pytest.mark.parametrize("error", [ImportError("vendor symbol missing"), RuntimeError("vendor init failed")])
+def test_installed_native_import_failure_is_not_hidden(monkeypatch, error):
+    from oscar_ascend import backend
+
+    monkeypatch.setattr(backend.util, "find_spec", lambda name: object())
+
+    def load(name):
+        if name == "vllm.platforms":
+            return NS(current_platform=NS(device_type="npu"))
+        raise error
+
+    monkeypatch.setattr(backend, "import_module", load)
+    with pytest.raises(RuntimeError, match="could not import") as caught:
+        backend._load_attention_types()
+    assert caught.value.__cause__ is error
+
+
+def test_cpu_attention_states_only_when_both_packages_absent(monkeypatch):
+    from oscar_ascend import backend
+
+    monkeypatch.setattr(backend.util, "find_spec", lambda name: None)
+    base, state = backend._load_attention_types()
+    assert base is object
+    assert state.ChunkedPrefill != state.DecodeOnly
