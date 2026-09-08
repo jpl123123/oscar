@@ -57,3 +57,11 @@
 5. 覆盖请求结束后的block复用、MTP连续拒绝/重写、长短请求混批、接近容量上限的持续负载。KV传输/换出、图捕获和PP>1当前未实现额外arena生命周期同步。
 
 校准数据代表性、模型指纹及全链路质量基准仍需进一步工作；本轮的严格旋转加载解决了缺层/坏矩阵静默回退，但没有把单段校准文本改造成代表性数据集。
+
+## Ascend decode stage2 编译故障修复
+
+用户在 Ascend910B4 上反馈：ref probe、Triton store 字节一致性和反量化检查通过，但 decode stage2 编译报 `unsupported datatype for arith::ExtFOp to hfusion`。此前新增的分母下限 `1e-38` 低于 FP32 最小正规数，可能被 Triton 推断为 FP64，与报错吻合（上游类型推断讨论：https://github.com/triton-lang/triton/issues/6251）。尚未取得目标环境 IR，因此这是依据代码与日志作出的定位，需真机复验。
+
+归并内核改用 `tl.where(e_sum > 0.0, e_sum, 1.0)`，除法和 log 共用安全分母；非空结果保持原公式，空序列输出零、LSE 为负无穷。普通 decode 与 paged attention 共用此修复。
+
+新增 JIT 浮点字面量守卫，以及执行实际归并尾部表达式的 CPU 类型/数值回归。33 项 pytest、17 项 CPU 数值镜像、测试文件 Ruff 和 diff whitespace 检查通过。未在本机执行 Ascend 编译；需重新运行一键启动门禁确认。

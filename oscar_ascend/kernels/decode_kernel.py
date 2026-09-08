@@ -285,8 +285,12 @@ if triton is not None:
                 term = term * old_scale + exp_logic * o
                 e_sum = e_sum * old_scale + exp_logic
                 m = m_new
-        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term / tl.maximum(e_sum, 1e-38), mask=d_mask)
-        tl.store(Lse_ptr + bid * stride_lse_b + hid, m + tl.log(e_sum))
+        # Avoid a tiny Python float literal: Triton may infer fp64 for values
+        # below 2**-126, which Ascend hfusion cannot lower (arith::ExtFOp).
+        # Nonempty softmax sums are positive; empty splits leave term=0, m=-inf.
+        safe_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+        tl.store(Out_ptr + bid * stride_out_b + hid * stride_out_h + d_offs, term / safe_sum, mask=d_mask)
+        tl.store(Lse_ptr + bid * stride_lse_b + hid, m + tl.log(safe_sum))
 
 
 if triton is not None:  # noqa: E305
