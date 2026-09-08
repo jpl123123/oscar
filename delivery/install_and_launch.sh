@@ -217,8 +217,12 @@ fi
 
 # Multi-query kernel is gated separately: existing decode probes do not cover MTP.
 if [ "${OSCAR_SKIP_PROBES:-0}" != "1" ]; then
-    "$PYTHON" delivery/probe_prefill.py --device npu \
+    PREP_MODE="${OSCAR_ASCEND_FUSED_PREP:-${OSCAR_ASCEND_USE_TRITON:-1}}"
+    OSCAR_ASCEND_FUSED_PREP="$PREP_MODE" "$PYTHON" delivery/probe_prefill.py --device npu \
         || fail "原生融合 prefill probe FAIL — 拒绝 serve"
+    export OSCAR_ASCEND_FUSED_PREP="$PREP_MODE"
+else
+    export OSCAR_ASCEND_FUSED_PREP=0
 fi
 
 # The vector paged kernel is an explicit experiment: target profiling measured

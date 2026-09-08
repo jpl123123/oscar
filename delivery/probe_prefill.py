@@ -53,7 +53,54 @@ def run(device):
                 f"PREFILL PASS device={device} dtype={dtype} prefix={prefix} q_len={n}",
                 flush=True,
             )
+    if os.environ.get("OSCAR_ASCEND_FUSED_PREP", "1") == "1":
+        check_prepared_buffers(device)
     check_native_mtp(device)
+
+
+def check_prepared_buffers(device):
+    from oscar_ascend.kernels.prepare_kv import prepare_native_kv
+    from oscar_ascend.kernels.store_kernel import oscar_store_ref
+
+    torch.manual_seed(95)
+    prefix, bs, d = 257, 128, 256
+    bt = torch.tensor([3, 0, 2], dtype=torch.int32)
+    pos = torch.arange(prefix)
+    slots = bt[pos // bs].long() * bs + pos % bs
+    for hk in (1, 2):
+        for dtype in (torch.bfloat16, torch.int8):
+            kc = torch.zeros(4, bs, hk, d, dtype=dtype)
+            vc = torch.zeros_like(kc)
+            oldk, oldv = [torch.randn(prefix, hk, d) for _ in range(2)]
+            oscar_store_ref(oldk, oldv, kc, vc, slots)
+            sk, sv = [torch.randn(2, bs, hk, d) for _ in range(2)]
+            owner = torch.full((2, bs), -1, dtype=torch.int64)
+            for p in (0, 127, 128, 256):
+                block, off = int(bt[p // bs]), p % bs
+                owner[block % 2, off] = block
+            for output_dtype in (torch.bfloat16, torch.float16):
+                new = [torch.randn(4, hk, d, dtype=output_dtype) for _ in range(2)]
+                for stage in (None, (sk, sv, owner)):
+                    expected = prepare_native_kv(
+                        kc, vc, bt, prefix, *new, stage, use_triton=False
+                    )
+                    dev_stage = (
+                        None if stage is None else tuple(t.to(device) for t in stage)
+                    )
+                    actual = prepare_native_kv(
+                        kc.to(device),
+                        vc.to(device),
+                        bt.to(device),
+                        prefix,
+                        *(t.to(device) for t in new),
+                        dev_stage,
+                        use_triton=device == "npu",
+                    )
+                    for got, want in zip(actual, expected):
+                        torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+            print(
+                f"PREP BUFFERS PASS device={device} hk={hk} cache={dtype}", flush=True
+            )
 
 
 def check_native_mtp(device):
@@ -97,6 +144,9 @@ def check_native_mtp(device):
             impl.key_cache = impl.value_cache = None
             impl._oscar_setup()
             impl._oscar.use_paged = False
+            impl._oscar.use_fused_prep = (
+                os.environ.get("OSCAR_ASCEND_FUSED_PREP", "1") == "1"
+            )
             impl._oscar_use_triton = (
                 device == "npu"
                 and os.environ.get("OSCAR_ASCEND_USE_TRITON", "1") == "1"
@@ -174,6 +224,7 @@ def check_native_mtp(device):
             print(
                 f"NATIVE MTP PASS device={device} prefix={prefix} q_len={nq} hq={hq} "
                 f"block_size={bs} window={window} full_forward_ms={elapsed:.3f} "
+                f"fused_prep={impl._oscar.use_fused_prep} "
                 "(single layer; excludes model/communication)",
                 flush=True,
             )

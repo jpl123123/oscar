@@ -16,7 +16,8 @@ from .format import K_IDX_OFF, VALUES_PER_BYTE, check_d
 from .kernels.decode_kernel import oscar_decode_ref
 from .kernels.dequant_kernel import oscar_full_dequant
 from .kernels.dequant_kernel import triton as _k_triton
-from .kernels.prefill import oscar_prefill
+from .kernels.prefill import oscar_prefill, oscar_prefill_prepared
+from .kernels.prepare_kv import prepare_native_kv
 from .kernels.store_kernel import oscar_store_ref
 from .rotation import get_layer_rotation
 
@@ -381,6 +382,18 @@ class AscendOscarAttentionBackendImpl(AscendAttentionBackendImpl):  # type: igno
                     torch.zeros(0, Hk, D, device=query.device),
                     self.scale, Hk, D,
                 )
+            elif self._oscar.use_fused_prep:
+                rk, rv = self._layer_rots(layer, query.device)
+                stage = None
+                if self._oscar.window_enabled and self._oscar_stage_ready:
+                    stage = (layer._oscar_stage_k, layer._oscar_stage_v, layer._oscar_slot_owner)
+                k_full, v_full = prepare_native_kv(
+                    self.key_cache, self.value_cache, attn_metadata.block_tables[i], cached_len,
+                    (k_seq.float() @ rk).to(query.dtype), (v_seq.float() @ rv).to(query.dtype),
+                    stage, use_triton=self._oscar_use_triton,
+                )
+                out = oscar_prefill_prepared((q_seq.float() @ rk).to(query.dtype), k_full, v_full, self.scale, Hk, D)
+                out = out.float() @ rv.t()
             else:
                 bt_row = attn_metadata.block_tables[i]
                 k_cached, v_cached = oscar_full_dequant(

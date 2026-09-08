@@ -48,6 +48,7 @@ class OscarAscendConfig:
     use_triton: bool = True           # HAS_TRITON 且未强制 torch 时
     window_enabled: bool = True
     use_paged: bool = False  # enable only after NPU paged probe
+    use_fused_prep: bool = False  # enable after native MTP preparation probe
     verbose: bool = True
     extra: dict = field(default_factory=dict)
 
@@ -87,6 +88,7 @@ class OscarAscendConfig:
         )
         cfg.window_enabled = cfg.staging_tokens > 0 and (cfg.sink_tokens > 0 or cfg.recent_tokens > 0)
         cfg.use_paged = os.environ.get("OSCAR_ASCEND_USE_PAGED", "0") == "1"
+        cfg.use_fused_prep = os.environ.get("OSCAR_ASCEND_FUSED_PREP", "0") == "1"
         if not all(0 <= r <= 1 for r in (cfg.k_clip_ratio, cfg.v_clip_ratio)):
             raise ValueError("OSCAR clip ratios must be finite and in [0, 1]")
         if cfg.group_size != 0:

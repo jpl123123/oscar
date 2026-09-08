@@ -109,6 +109,7 @@ def timed(label, fn):
                 "query_dtype": str(query.dtype),
                 "use_triton": impl._oscar_use_triton,
                 "use_paged": impl._oscar.use_paged,
+                "use_fused_prep": impl._oscar.use_fused_prep,
                 "cache_shape": list(impl.key_cache.shape)
                 if impl.key_cache is not None
                 else None,
@@ -172,10 +173,11 @@ def install_diagnostics(runner_class):
     ):
         setattr(cls, name, timed(name.removeprefix("_"), getattr(cls, name)))
     backend.staging_order = timed("staging_sort", backend.staging_order)
+    backend.prepare_native_kv = timed("prepare_native_kv", backend.prepare_native_kv)
     paged_attention.oscar_paged_attention_triton = timed(
         "paged_attention", paged_attention.oscar_paged_attention_triton
     )
-    prefill.npu_prefill = timed("native_prefill", prefill.npu_prefill)
+    prefill.npu_prefill_prepared = timed("native_attention", prefill.npu_prefill_prepared)
     original_execute = runner_class.execute_model
     original_sample = runner_class.sample_tokens
 

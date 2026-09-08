@@ -70,3 +70,15 @@ paged约占模型执行92%，每FULL层约272 ms；后续步骤没有随首轮�
 本轮默认禁用自写paged内核，改用每请求一次历史反量化 + 窗口拼接 + 原生融合attention，涵盖MTP和有新K/V的DecodeOnly；显式USE_PAGED=1保留实验入口。INT2常驻缓存、旋转、当前chunk未量化K/V与窗口owner语义保留；计算使用bf16/fp16融合算子，舍入顺序与FP32向量内核不同。该路线需要临时dense KV，临时显存和端到端质量仍需复验。
 
 扩展门禁：实际6:1 GQA，24579前缀，4-token query，非单位旋转，128/1536物理页，窗口开/关，比较真实backend.forward与独立CPU分页oracle，并在预热后报告单层完整forward耗时。新增CPU回归验证DecodeOnly/SpecDecoding、非连续物理页、只反量化一次、padding不参与注意力。59项pytest及8个原有prefill case、4个24K backend case通过。本机仍无NPU，不把CPU耗时当成NPU提速结果。
+
+## 04:38复测：模型执行约8.5倍改善，优化KV准备
+
+真实cache shape=[11772,128,1,256]，use_paged=false。第4/5步execute_model约556 ms（此前4721/4725 ms），16层OSCAR forward约279 ms（此前4446/4449 ms）。这是相同同步诊断口径下的模型执行改善，不是端到端吞吐倍数。诊断后的服务generation达到11.3 tokens/s，但尚未达到此前原生水平。
+
+剩余分段：prefill_attention约197 ms，native_prefill自身约8.4 ms，进入该调用前wait_before约165.7 ms；staging_write约53 ms、store约25 ms。进入原生调用前提交了历史反量化、窗口拼接、类型转换及Q/K/V旋转，因此165.7 ms只能归到这段准备工作，不能全部算成原生算子时间，也不能在没有细分测量时全部算给dequant。
+
+新增 `prepare_native_kv`：4-token tile、K/V分别launch以缩小同时存活数据；把INT2解码、owner匹配窗口值、FP16中间舍入和最终输入类型转换合到输出写入。输出直接按prefix+current长度分配，只有current尾部copy，避免独立全prefix gather/where/cast和concat。新的 `npu_prefill_prepared`直接消费该缓冲。保留旧路径通过FUSED_PREP=0对照；一键默认先经过新门禁才启用，Triton关闭或跳过门禁时不自动开启。
+
+门禁增加准备缓冲的逐元素比较：257个历史token（尾tile）、非连续页、Hk=1/2、bf16/int8物理cache、fp16/bf16输出、窗口命中/缺失和owner碰撞。随后继续跑完整24K MTP及计时。74项本地pytest和CPU门禁通过；尚未在本机执行新Triton内核，不能宣称新增融合已有NPU收益。
+
+PERF新增prepare_native_kv计时；原生算子改标为native_attention，边界为已准备好完整输入的调用，避免与旧native_prefill（包含concat）的计时混淆。比较收益仍以execute_model和forward的相同边界为主。

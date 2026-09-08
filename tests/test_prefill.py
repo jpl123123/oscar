@@ -6,12 +6,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from oscar_ascend.kernels.prefill import _causal_mask, npu_prefill
+from oscar_ascend.kernels.prefill import _causal_mask, npu_prefill, npu_prefill_prepared
 
 
 @pytest.mark.parametrize("prefix,n", [(0, 17), (65, 1), (2049, 33)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_prefill_gqa_and_right_aligned_causality(monkeypatch, prefix, n, dtype):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_native_prefill_gqa_and_right_aligned_causality(
+    monkeypatch, prefix, n, dtype, prepared
+):
     torch.manual_seed(17)
     q = torch.randn(n, 4, 64).to(dtype)
     k, v = [torch.randn(prefix + n, 1, 64).to(dtype) for _ in range(2)]
@@ -44,8 +47,10 @@ def test_native_prefill_gqa_and_right_aligned_causality(monkeypatch, prefix, n, 
         "torch_npu",
         SimpleNamespace(npu_fused_infer_attention_score=native),
     )
-    actual = npu_prefill(
-        q, k[prefix:], v[prefix:], k[:prefix], v[:prefix], 0.125, 1, 64
+    actual = (
+        npu_prefill(q, k[prefix:], v[prefix:], k[:prefix], v[:prefix], 0.125, 1, 64)
+        if not prepared
+        else npu_prefill_prepared(q, k, v, 0.125, 1, 64)
     )
     # Independently compute each query over its own visible prefix.
     expected = torch.stack(
@@ -64,7 +69,7 @@ def test_native_prefill_gqa_and_right_aligned_causality(monkeypatch, prefix, n, 
         ]
     )
     torch.testing.assert_close(actual, expected)
-    if prefix == 0:
+    if prefix == 0 or prepared:
         assert calls[0]["key"].data_ptr() == k.data_ptr()
     assert calls[0]["atten_mask"] is _causal_mask(q.device)
 

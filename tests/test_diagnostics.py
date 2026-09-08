@@ -67,12 +67,13 @@ def test_runner_capture_is_bounded_and_skips_empty_steps(monkeypatch, capsys):
     # Keep instrumentation mutations local to this test.
     monkeypatch.setattr(backend, "AscendOscarAttentionBackendImpl", Impl)
     monkeypatch.setattr(backend, "staging_order", backend.staging_order)
+    monkeypatch.setattr(backend, "prepare_native_kv", backend.prepare_native_kv)
     monkeypatch.setattr(
         paged_attention,
         "oscar_paged_attention_triton",
         paged_attention.oscar_paged_attention_triton,
     )
-    monkeypatch.setattr(prefill, "npu_prefill", prefill.npu_prefill)
+    monkeypatch.setattr(prefill, "npu_prefill_prepared", prefill.npu_prefill_prepared)
     monkeypatch.setenv("OSCAR_ASCEND_PROFILE_STEPS", "2")
 
     class Runner:
